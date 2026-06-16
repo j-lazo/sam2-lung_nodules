@@ -29,6 +29,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from datetime import datetime
+import socket
+import re
+import yaml
+
 import cv2
 import numpy as np
 import pandas as pd
@@ -51,8 +56,169 @@ IMAGE_MODES = ("auto", "point", "box", "point+box")
 # Basic utilities
 # -----------------------------------------------------------------------------
 
+def slugify(value: str, max_len: int = 120):
+    """
+    Convert arbitrary text into a filesystem-safe short name.
+    """
+    value = str(value)
+    value = value.replace("+", "plus")
+    value = re.sub(r"[^A-Za-z0-9._-]+", "-", value)
+    value = re.sub(r"-+", "-", value).strip("-_.")
+    return value[:max_len] if len(value) > max_len else value
 
-def normalize_to_uint8(img_2d: np.ndarray) -> np.ndarray:
+
+def format_float_for_name(value: Optional[float]):
+    """
+    0.10 -> 0p1, 0.005 -> 0p005, None -> all
+    """
+    if value is None:
+        return "all"
+    txt = f"{value:g}"
+    return txt.replace(".", "p")
+
+
+def build_experiment_name(args: argparse.Namespace):
+    """
+    Build a compact experiment folder name from main hyperparameters.
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    if args.mode == "video":
+        output_tag = "pm-" + "-".join(m.replace("+", "plus") for m in args.prompt_modes)
+    else:
+        output_tag = "out-" + "-".join(m.replace("+", "plus") for m in args.image_outputs)
+
+    triplet_tag = "triplet" if args.use_triplet_channels else "singlech"
+    frac_tag = f"frac-{format_float_for_name(args.dataset_fraction)}"
+
+    shard_tag = None
+    if getattr(args, "shard_count", 1) > 1:
+        shard_tag = f"shard-{args.shard_index}of{args.shard_count}"
+
+    auto_tag = None
+    if args.mode in {"auto", "image-single"} and "auto" in args.image_outputs:
+        auto_tag = (
+            f"autoA{args.auto_min_area}-{args.auto_max_area}"
+            f"_circ{format_float_for_name(args.auto_min_circularity)}"
+            f"_sol{format_float_for_name(args.auto_min_solidity)}"
+        )
+
+    parts = [
+        timestamp,
+        args.run_name,
+        args.mode,
+        output_tag,
+        args.amp_dtype,
+        triplet_tag,
+        frac_tag,
+    ]
+
+    if args.max_cases is not None:
+        parts.append(f"max-{args.max_cases}")
+    if shard_tag is not None:
+        parts.append(shard_tag)
+    if auto_tag is not None:
+        parts.append(auto_tag)
+
+    return slugify("_".join(parts), max_len=180)
+
+
+def namespace_to_yaml_dict(args: argparse.Namespace) :
+    """
+    Convert argparse Namespace to a YAML-safe dictionary.
+    Paths are stored as strings.
+    """
+    cfg = {}
+    for key, value in vars(args).items():
+        if isinstance(value, Path):
+            cfg[key] = str(value)
+        elif isinstance(value, (list, tuple)):
+            cfg[key] = list(value)
+        else:
+            cfg[key] = value
+    return cfg
+
+
+def write_yaml_config(config_path: Path, config: Dict):
+    """
+    Write config.yaml. Requires PyYAML; falls back to JSON-formatted text
+    with .yaml extension if PyYAML is unavailable.
+    """
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if yaml is not None:
+        with open(config_path, "w") as f:
+            yaml.safe_dump(config, f, sort_keys=False, default_flow_style=False)
+    else:
+        print("WARNING: PyYAML is not installed. Writing JSON-style config to .yaml file.")
+        with open(config_path, "w") as f:
+            json.dump(config, f, indent=2)
+
+
+def setup_experiment_dir(args: argparse.Namespace):
+    """
+    Create and return the experiment directory.
+
+    If --create-experiment-dir is enabled:
+        output-dir / experiment-name
+    Else:
+        output-dir
+    """
+    output_root = Path(args.output_dir).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    if args.create_experiment_dir:
+        exp_name = args.experiment_name or build_experiment_name(args)
+        exp_dir = output_root / exp_name
+    else:
+        exp_dir = output_root
+
+    exp_dir.mkdir(parents=True, exist_ok=args.overwrite_experiment)
+
+    if args.save_volumes:
+        (exp_dir / "predicted_volumes").mkdir(parents=True, exist_ok=True)
+
+    return exp_dir
+
+
+def save_experiment_config(
+    args: argparse.Namespace,
+    exp_dir: Path,
+    device: torch.device,
+    index: Optional[DatasetIndex] = None,):
+
+    """
+    Save hyperparameters and useful run metadata.
+    """
+    config = {
+        "experiment": {
+            "experiment_dir": str(exp_dir),
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "hostname": socket.gethostname(),
+            "command": " ".join(os.sys.argv),
+        },
+        "runtime": {
+            "device": str(device),
+            "cuda_available": torch.cuda.is_available(),
+            "cuda_device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        },
+        "arguments": namespace_to_yaml_dict(args),
+    }
+
+    if index is not None:
+        config["dataset_index"] = {
+            "dataset_dir": str(index.dataset_dir),
+            "volumes_dir": str(index.volumes_dir),
+            "masks_dir": str(index.masks_dir),
+            "annotations_csv": str(index.annotations_csv),
+            "links_csv": str(index.links_csv),
+            "n_selected_volumes": len(index.volume_ids),
+            "selected_volume_ids": index.volume_ids,
+        }
+
+    write_yaml_config(exp_dir / "config.yaml", config)
+
+def normalize_to_uint8(img_2d: np.ndarray):
     img_2d = img_2d.astype(np.float32)
     img_2d -= float(img_2d.min())
     max_val = float(img_2d.max())
@@ -61,7 +227,7 @@ def normalize_to_uint8(img_2d: np.ndarray) -> np.ndarray:
     return (img_2d * 255).astype(np.uint8)
 
 
-def dice_score(mask1: np.ndarray, mask2: np.ndarray, smooth: float = 1e-6) -> float:
+def dice_score(mask1: np.ndarray, mask2: np.ndarray, smooth: float = 1e-6):
     mask1 = mask1.astype(bool)
     mask2 = mask2.astype(bool)
     intersection = np.logical_and(mask1, mask2).sum(dtype=np.float64)
@@ -93,7 +259,7 @@ def safe_autocast(device: torch.device, amp_dtype: str):
     return torch.autocast("cuda", dtype=dtype)
 
 
-def configure_torch(device: torch.device, amp_dtype: str, allow_tf32: bool) -> None:
+def configure_torch(device: torch.device, amp_dtype: str, allow_tf32: bool):
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = bool(allow_tf32)
         torch.backends.cudnn.allow_tf32 = bool(allow_tf32)
@@ -105,7 +271,7 @@ def configure_torch(device: torch.device, amp_dtype: str, allow_tf32: bool) -> N
         print("WARNING: MPS support for SAM2 may give different or degraded results.")
 
 
-def select_device(device_arg: str) -> torch.device:
+def select_device(device_arg: str):
     if device_arg == "auto":
         if torch.cuda.is_available():
             return torch.device("cuda")
@@ -115,7 +281,7 @@ def select_device(device_arg: str) -> torch.device:
     return torch.device(device_arg)
 
 
-def env_int(name: str, default: int) -> int:
+def env_int(name: str, default: int):
     """Read an integer environment variable safely. Empty/non-integer values use default."""
     value = os.environ.get(name)
     if value is None or str(value).strip() == "":
@@ -900,6 +1066,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-gt-volume", action="store_true", help="Save GT mask next to predictions for inspection.")
     parser.add_argument("--csv-filename", default=None, help="Override CSV file name.")
     parser.add_argument("--fail-fast", action="store_true", help="Raise errors immediately instead of recording them in CSV.")
+    
+    parser.add_argument("--create-experiment-dir", action=argparse.BooleanOptionalAction, default=True,
+    help=("Create a timestamped experiment folder inside --output-dir. "
+    "Use --no-create-experiment-dir to write directly into --output-dir."),)
+
+    parser.add_argument("--experiment-name", default=None,
+            help=(
+            "Optional custom experiment folder name. If not provided, a name is built "
+            "from date/time and main hyperparameters."),)
+
+    parser.add_argument("--overwrite-experiment", action="store_true", help=(
+            "Allow writing into an existing experiment folder. Useful only when using "
+            "a fixed --experiment-name."),)
 
     args = parser.parse_args()
     if args.mode == "auto":
@@ -912,19 +1091,28 @@ def parse_args() -> argparse.Namespace:
 
 
 def expected_volume_paths(out_dir: Path, run_name: str, series_id: str, keys: Sequence[str]) -> List[Path]:
-    return [out_dir / f"{run_name}_volumes" / key / f"{series_id}_{key}.nii.gz" for key in keys]
+    return [
+        out_dir / "predicted_volumes" / key / f"{series_id}_{key}.nii.gz"
+        for key in keys
+    ]
 
 
 def main():
+
     args = parse_args()
-    out_dir = Path(args.output_dir).expanduser().resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     device = select_device(args.device)
     configure_torch(device, args.amp_dtype, args.allow_tf32)
+
+    out_dir = setup_experiment_dir(args)
+
     print(f"Using device: {device}; mode={args.mode}; amp={args.amp_dtype}; tf32={args.allow_tf32}")
+    print(f"Experiment directory: {out_dir}")
 
     index = build_dataset_index(args)
+
+    save_experiment_config(args=args, exp_dir=out_dir, device=device, index=index)
+    print(f"Saved config: {out_dir / 'config.yaml'}")
     print(f"Selected {len(index.volume_ids)} volumes for this run/shard.")
     print(f"Shard index/count: {args.shard_index}/{args.shard_count}; prefetch_cases={args.prefetch_cases}")
 
@@ -945,7 +1133,8 @@ def main():
         mask_generator = build_mask_generator(args, device)
 
     rows: List[Dict] = []
-    csv_name = args.csv_filename or f"{args.run_name}_{args.mode}.csv"
+
+    csv_name = args.csv_filename or "predictions.csv"
     csv_path = out_dir / csv_name
 
     case_iter = iter_loaded_cases(index, args.prefetch_cases)
@@ -983,16 +1172,20 @@ def main():
             else:
                 raise ValueError(args.mode)
 
-            row.update({"status": "ok", "mask_path": str(mask_path), "n_slices": int(gt_volume.shape[0])})
+            row.update({"status": "ok", "mask_file": Path(mask_path).name, "n_slices": int(gt_volume.shape[0]),})
+
             rows.append(row)
 
             if args.save_volumes:
+                pred_root = out_dir / "predicted_volumes"
+
                 for key, vol in pred_volumes.items():
                     safe_key = key.replace("+", "_")
-                    out_path = out_dir / f"{args.run_name}_volumes" / safe_key / f"{series_id}_{safe_key}.nii.gz"
+                    out_path = pred_root / safe_key / f"{series_id}_{safe_key}.nii.gz"
                     write_pred_volume(vol, image_itk, out_path)
+
                 if args.save_gt_volume:
-                    out_path = out_dir / f"{args.run_name}_volumes" / "gt" / f"{series_id}_gt.nii.gz"
+                    out_path = pred_root / "gt" / f"{series_id}_gt.nii.gz"
                     write_pred_volume(gt_volume, image_itk, out_path)
 
         except Exception as exc:
