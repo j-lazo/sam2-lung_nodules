@@ -11,7 +11,7 @@ Modes
 
 The script writes one CSV with Dice scores per volume. Optionally, it also writes
 predicted volumes as NIfTI files. It supports dataset subsampling and SLURM-style
-sharding so multiple H200 jobs can split the dataset without duplicating work.
+sharding so multiple H200 jobs can split the dataset without duplicating work. It can also prefetch CT volumes on CPU while the GPU is running inference.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ import math
 import os
 import shutil
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -112,6 +113,18 @@ def select_device(device_arg: str) -> torch.device:
             return torch.device("mps")
         return torch.device("cpu")
     return torch.device(device_arg)
+
+
+def env_int(name: str, default: int) -> int:
+    """Read an integer environment variable safely. Empty/non-integer values use default."""
+    value = os.environ.get(name)
+    if value is None or str(value).strip() == "":
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        print(f"WARNING: ignoring non-integer ${name}={value!r}; using {default}.")
+        return default
 
 
 # -----------------------------------------------------------------------------
@@ -240,6 +253,47 @@ def load_case(index: DatasetIndex, series_id: str) -> Optional[Tuple[sitk.Image,
     if image_array.shape != gt_volume.shape:
         raise ValueError(f"Shape mismatch for {series_id}: image {image_array.shape}, mask {gt_volume.shape}")
     return image_itk, image_array, gt_volume, mask_path
+
+
+def load_case_safe(index: DatasetIndex, series_id: str):
+    """Load one case and return (series_id, loaded_tuple_or_none, exception_or_none)."""
+    try:
+        return series_id, load_case(index, series_id), None
+    except Exception as exc:
+        return series_id, None, exc
+
+
+def iter_loaded_cases(index: DatasetIndex, prefetch_cases: int):
+    """
+    Ordered iterator over loaded cases.
+
+    prefetch_cases > 0 overlaps CPU/SimpleITK I/O with GPU inference. This is the
+    useful DataLoader-like optimization here, because SAM2 itself does not expose
+    a clean batch-of-volumes inference API for different CT volumes.
+    """
+    ids = list(index.volume_ids)
+    if prefetch_cases <= 0:
+        for series_id in ids:
+            yield load_case_safe(index, series_id)
+        return
+
+    max_workers = max(1, int(prefetch_cases))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        iterator = iter(ids)
+        futures = {}
+
+        for _ in range(min(max_workers, len(ids))):
+            series_id = next(iterator)
+            futures[series_id] = executor.submit(load_case_safe, index, series_id)
+
+        for series_id in ids:
+            fut = futures.pop(series_id)
+            try:
+                next_series_id = next(iterator)
+                futures[next_series_id] = executor.submit(load_case_safe, index, next_series_id)
+            except StopIteration:
+                pass
+            yield fut.result()
 
 
 def write_pred_volume(pred: np.ndarray, reference_image: sitk.Image, out_path: Path) -> None:
@@ -477,7 +531,7 @@ def predict_image_single(
     mask_generator: Optional[SAM2AutomaticMaskGenerator],
     args: argparse.Namespace,
     device: torch.device,
-) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
+):
     prompts = build_slice_prompt_dict(gt_volume)
     if len(prompts) == 0:
         raise ValueError("No valid GT-positive prompt slices found")
@@ -566,7 +620,7 @@ def predict_image_multi(
     predictor: SAM2ImagePredictor,
     args: argparse.Namespace,
     device: torch.device,
-) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
+):
     prompts = build_slice_prompt_dict(gt_volume)
     if len(prompts) == 0:
         raise ValueError("No valid GT-positive prompt slices found")
@@ -660,7 +714,7 @@ def add_sam2_prompt_for_object(
     raise ValueError(f"Unknown prompt_mode: {prompt_mode}")
 
 
-def accumulate_video_propagation(predictor, inference_state, pred_by_obj: Dict[int, np.ndarray], reverse: bool) -> None:
+def accumulate_video_propagation(predictor, inference_state, pred_by_obj: Dict[int, np.ndarray], reverse: bool):
     """Propagate and OR into pred_by_obj. reverse=True is important for full-volume masks."""
     kwargs = {"reverse": True} if reverse else {}
     try:
@@ -685,7 +739,7 @@ def predict_video(
     predictor,
     args: argparse.Namespace,
     device: torch.device,
-) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
+):
     prompts = extract_nodule_prompts_from_3d_mask(gt_volume)
     if len(prompts) == 0:
         raise ValueError("No 3D connected nodules found in mask")
@@ -814,8 +868,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--case-list", default=None, help="Text file with one SeriesID per line.")
     parser.add_argument("--shuffle", action="store_true", help="Shuffle before fraction/max/sharding selection.")
     parser.add_argument("--seed", type=int, default=123)
-    parser.add_argument("--shard-index", type=int, default=int(os.environ.get("SLURM_ARRAY_TASK_ID", 0) or 0))
-    parser.add_argument("--shard-count", type=int, default=int(os.environ.get("SLURM_ARRAY_TASK_COUNT", 1) or 1))
+    parser.add_argument(
+        "--shard-index",
+        nargs="?",
+        type=int,
+        const=env_int("SLURM_ARRAY_TASK_ID", 0),
+        default=env_int("SLURM_ARRAY_TASK_ID", 0),
+        help=(
+            "Shard index. If the flag is provided without a value, the script uses "
+            "SLURM_ARRAY_TASK_ID or 0. This avoids argparse failures when the "
+            "SLURM variable is empty."
+        ),
+    )
+    parser.add_argument(
+        "--shard-count",
+        nargs="?",
+        type=int,
+        const=env_int("SLURM_ARRAY_TASK_COUNT", 1),
+        default=env_int("SLURM_ARRAY_TASK_COUNT", 1),
+        help=(
+            "Number of shards. If omitted after the flag, uses SLURM_ARRAY_TASK_COUNT or 1. "
+            "For SLURM arrays you can also set this manually to the total number of jobs."
+        ),
+    )
+    parser.add_argument("--prefetch-cases", type=int, default=0, help="CPU/SimpleITK case prefetch workers. Try 1-2 on a cluster; higher uses more RAM.")
     parser.add_argument("--skip-existing", action="store_true", help="Skip cases whose requested prediction volumes already exist. Useful for resuming.")
     parser.add_argument("--empty-cache-every", type=int, default=10, help="Call torch.cuda.empty_cache every N cases; 0 disables.")
 
@@ -839,7 +915,7 @@ def expected_volume_paths(out_dir: Path, run_name: str, series_id: str, keys: Se
     return [out_dir / f"{run_name}_volumes" / key / f"{series_id}_{key}.nii.gz" for key in keys]
 
 
-def main() -> None:
+def main():
     args = parse_args()
     out_dir = Path(args.output_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -850,6 +926,7 @@ def main() -> None:
 
     index = build_dataset_index(args)
     print(f"Selected {len(index.volume_ids)} volumes for this run/shard.")
+    print(f"Shard index/count: {args.shard_index}/{args.shard_count}; prefetch_cases={args.prefetch_cases}")
 
     # Build only the models required by the selected mode/output to avoid wasting H200 memory.
     image_predictor = None
@@ -871,9 +948,14 @@ def main() -> None:
     csv_name = args.csv_filename or f"{args.run_name}_{args.mode}.csv"
     csv_path = out_dir / csv_name
 
-    for case_idx, series_id in enumerate(tqdm.tqdm(index.volume_ids, desc="Volumes"), start=1):
+    case_iter = iter_loaded_cases(index, args.prefetch_cases)
+    for case_idx, (series_id, loaded, load_error) in enumerate(
+        tqdm.tqdm(case_iter, total=len(index.volume_ids), desc="Volumes"),
+        start=1,
+    ):
         try:
-            loaded = load_case(index, series_id)
+            if load_error is not None:
+                raise load_error
             if loaded is None:
                 rows.append({"VolumeID": series_id, "status": "missing_input"})
                 continue
