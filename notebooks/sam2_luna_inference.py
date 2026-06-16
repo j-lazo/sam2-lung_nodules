@@ -32,6 +32,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from datetime import datetime
 import socket
 import re
+import hashlib
 import yaml
 
 import cv2
@@ -90,6 +91,9 @@ def build_experiment_name(args: argparse.Namespace):
 
     triplet_tag = "triplet" if args.use_triplet_channels else "singlech"
     frac_tag = f"frac-{format_float_for_name(args.dataset_fraction)}"
+    perturb_tag = None
+    if getattr(args, "prompt_perturb_rmax", 0) > 0:
+        perturb_tag = f"perturb-r{int(args.prompt_perturb_rmax)}"
 
     shard_tag = None
     if getattr(args, "shard_count", 1) > 1:
@@ -115,6 +119,8 @@ def build_experiment_name(args: argparse.Namespace):
 
     if args.max_cases is not None:
         parts.append(f"max-{args.max_cases}")
+    if perturb_tag is not None:
+        parts.append(perturb_tag)
     if shard_tag is not None:
         parts.append(shard_tag)
     if auto_tag is not None:
@@ -235,7 +241,7 @@ def dice_score(mask1: np.ndarray, mask2: np.ndarray, smooth: float = 1e-6):
     return float((2.0 * intersection + smooth) / (total + smooth))
 
 
-def build_sam2_input_slice(image_array: np.ndarray, z: int, use_triplet_channels: bool = False) -> np.ndarray:
+def build_sam2_input_slice(image_array: np.ndarray, z: int, use_triplet_channels: bool = False):
     """Return [H, W, 3] uint8. If triplet, channels are z-1/z/z+1."""
     if use_triplet_channels:
         z_prev = max(z - 1, 0)
@@ -291,6 +297,116 @@ def env_int(name: str, default: int):
     except ValueError:
         print(f"WARNING: ignoring non-integer ${name}={value!r}; using {default}.")
         return default
+
+
+def stable_uint32_seed(*items) -> int:
+    """
+    Build a process-independent uint32 seed from stable identifiers.
+
+    Do not use Python's built-in hash() here because it is randomized per process.
+    This makes prompt perturbations reproducible across reruns, SLURM shards,
+    multiprocessing, and different GPU ranks, as long as the inputs are the same.
+    """
+    payload = "::".join(str(item) for item in items).encode("utf-8")
+    digest = hashlib.blake2b(payload, digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="little", signed=False) % (2**32)
+
+
+def sample_prompt_shift_xy(
+    base_seed: int,
+    series_id: str,
+    prompt_scope: str,
+    z: int,
+    prompt_index: int,
+    rmax: int,
+) -> Tuple[int, int]:
+    """
+    Deterministically sample an integer pixel shift (dx, dy) in [-rmax, +rmax].
+
+    The sample depends only on the stable prompt identity, not on iteration order.
+    Therefore the same case receives the same perturbations in single-process,
+    multi-process, or SLURM-array executions.
+    """
+    rmax = int(rmax)
+    if rmax <= 0:
+        return 0, 0
+    seed = stable_uint32_seed(base_seed, series_id, prompt_scope, z, prompt_index, rmax)
+    rng = np.random.default_rng(seed)
+    dx, dy = rng.integers(-rmax, rmax + 1, size=2, endpoint=False)
+    return int(dx), int(dy)
+
+
+def clip_point_xy(point_xy: np.ndarray, image_shape_hw: Tuple[int, int]) -> np.ndarray:
+    """Clip point coordinates to valid image coordinates."""
+    H, W = image_shape_hw
+    point = np.asarray(point_xy, dtype=np.float32).copy()
+    point[..., 0] = np.clip(point[..., 0], 0, W - 1)
+    point[..., 1] = np.clip(point[..., 1], 0, H - 1)
+    return point
+
+
+def clip_box_xyxy(box_xyxy: np.ndarray, image_shape_hw: Tuple[int, int]) -> np.ndarray:
+    """Clip an xyxy box to valid image coordinates."""
+    H, W = image_shape_hw
+    box = np.asarray(box_xyxy, dtype=np.float32).copy()
+    box[..., 0] = np.clip(box[..., 0], 0, W - 1)
+    box[..., 2] = np.clip(box[..., 2], 0, W - 1)
+    box[..., 1] = np.clip(box[..., 1], 0, H - 1)
+    box[..., 3] = np.clip(box[..., 3], 0, H - 1)
+    return box
+
+
+def recenter_box_xyxy_at_point(
+    box_xyxy: np.ndarray,
+    center_xy: Sequence[float],
+    image_shape_hw: Tuple[int, int],
+) -> np.ndarray:
+    """
+    Preserve the original box size and move its center to center_xy when possible.
+
+    If center_xy is close to an image border, the box is shifted back inside the
+    image while preserving size as much as possible. This avoids invalid prompts.
+    """
+    H, W = image_shape_hw
+    original = np.asarray(box_xyxy, dtype=np.float32)
+    original_shape = original.shape
+    x1, y1, x2, y2 = original.reshape(4).tolist()
+
+    box_w = max(0.0, x2 - x1)
+    box_h = max(0.0, y2 - y1)
+    cx, cy = float(center_xy[0]), float(center_xy[1])
+
+    new_x1 = cx - box_w / 2.0
+    new_x2 = cx + box_w / 2.0
+    new_y1 = cy - box_h / 2.0
+    new_y2 = cy + box_h / 2.0
+
+    # Keep the box inside image bounds while preserving width/height when possible.
+    if box_w >= W - 1:
+        new_x1, new_x2 = 0.0, float(W - 1)
+    else:
+        if new_x1 < 0:
+            new_x2 -= new_x1
+            new_x1 = 0.0
+        if new_x2 > W - 1:
+            new_x1 -= new_x2 - (W - 1)
+            new_x2 = float(W - 1)
+        new_x1 = max(0.0, new_x1)
+
+    if box_h >= H - 1:
+        new_y1, new_y2 = 0.0, float(H - 1)
+    else:
+        if new_y1 < 0:
+            new_y2 -= new_y1
+            new_y1 = 0.0
+        if new_y2 > H - 1:
+            new_y1 -= new_y2 - (H - 1)
+            new_y2 = float(H - 1)
+        new_y1 = max(0.0, new_y1)
+
+    recentered = np.array([new_x1, new_y1, new_x2, new_y2], dtype=np.float32)
+    recentered = clip_box_xyxy(recentered, image_shape_hw)
+    return recentered.reshape(original_shape)
 
 
 # -----------------------------------------------------------------------------
@@ -501,6 +617,8 @@ def extract_blobs_from_slice(mask_2d: np.ndarray) -> List[Dict]:
                 "contour": contour,
             }
         )
+    # Make blob indexing deterministic for prompt perturbation identities.
+    blobs.sort(key=lambda b: (b["bbox"][1], b["bbox"][0], b["bbox"][3], b["bbox"][2]))
     return blobs
 
 
@@ -568,6 +686,98 @@ def extract_nodule_prompts_from_3d_mask(mask_zyx: np.ndarray) -> List[Dict]:
         )
         obj_id += 1
     return prompts
+
+
+def perturb_slice_prompt_dicts(
+    slice_dicts: List[Dict],
+    series_id: str,
+    image_shape_hw: Tuple[int, int],
+    rmax: int,
+    seed: int,
+) -> List[Dict]:
+    """
+    Apply deterministic xy perturbations to slice-wise point and box prompts.
+
+    For each blob on each slice, the point is shifted by the sampled (dx, dy), and
+    the corresponding box is recentered on the shifted point while preserving its
+    original size as much as possible. The same perturbed prompt is then reused by
+    point, box, and point+box outputs.
+    """
+    rmax = int(rmax)
+    if rmax <= 0:
+        return slice_dicts
+
+    perturbed = []
+    for info in slice_dicts:
+        new_info = dict(info)
+        z = int(info["z"])
+        points = np.asarray(info["point_coords"], dtype=np.float32).copy()
+        boxes = np.asarray(info["boxes"], dtype=np.float32).copy()
+        shifts = []
+
+        for i in range(points.shape[0]):
+            dx, dy = sample_prompt_shift_xy(
+                base_seed=seed,
+                series_id=series_id,
+                prompt_scope="image-slice",
+                z=z,
+                prompt_index=i,
+                rmax=rmax,
+            )
+            shifted_point = clip_point_xy(points[i] + np.array([dx, dy], dtype=np.float32), image_shape_hw)
+            points[i] = shifted_point
+            boxes[i] = recenter_box_xyxy_at_point(boxes[i], shifted_point, image_shape_hw)
+            shifts.append([dx, dy])
+
+        new_info["point_coords"] = points
+        new_info["boxes"] = boxes
+        new_info["perturb_shifts_xy"] = np.array(shifts, dtype=np.int32)
+        perturbed.append(new_info)
+
+    return perturbed
+
+
+def perturb_3d_nodule_prompts(
+    prompts: List[Dict],
+    series_id: str,
+    image_shape_hw: Tuple[int, int],
+    rmax: int,
+    seed: int,
+) -> List[Dict]:
+    """
+    Apply deterministic xy perturbations to video-mode 3D object prompts.
+
+    The z/frame index is unchanged. Only the 2D prompt location on the selected
+    frame is shifted. The same shifted point/box is used for all requested video
+    prompt modes.
+    """
+    rmax = int(rmax)
+    if rmax <= 0:
+        return prompts
+
+    perturbed = []
+    for p in prompts:
+        new_p = dict(p)
+        z = int(p["frame_idx"])
+        obj_id = int(p["obj_id"])
+        dx, dy = sample_prompt_shift_xy(
+            base_seed=seed,
+            series_id=series_id,
+            prompt_scope="video-object",
+            z=z,
+            prompt_index=obj_id,
+            rmax=rmax,
+        )
+        point = np.asarray(p["point_xy"], dtype=np.float32).copy()
+        shifted_point = clip_point_xy(point + np.array([[dx, dy]], dtype=np.float32), image_shape_hw)
+
+        new_p["point_xy"] = shifted_point
+        new_p["box_xyxy"] = recenter_box_xyxy_at_point(p["box_xyxy"], shifted_point[0], image_shape_hw)
+        new_p["perturb_shift_xy"] = (dx, dy)
+        new_p["center_zyx_perturbed"] = (z, int(round(float(shifted_point[0, 1]))), int(round(float(shifted_point[0, 0]))))
+        perturbed.append(new_p)
+
+    return perturbed
 
 
 # -----------------------------------------------------------------------------
@@ -699,6 +909,13 @@ def predict_image_single(
     device: torch.device,
 ):
     prompts = build_slice_prompt_dict(gt_volume)
+    prompts = perturb_slice_prompt_dicts(
+        prompts,
+        series_id=series_id,
+        image_shape_hw=gt_volume.shape[1:],
+        rmax=args.prompt_perturb_rmax,
+        seed=args.seed,
+    )
     if len(prompts) == 0:
         raise ValueError("No valid GT-positive prompt slices found")
     prompt_by_z = {d["z"]: d for d in prompts}
@@ -788,6 +1005,13 @@ def predict_image_multi(
     device: torch.device,
 ):
     prompts = build_slice_prompt_dict(gt_volume)
+    prompts = perturb_slice_prompt_dicts(
+        prompts,
+        series_id=series_id,
+        image_shape_hw=gt_volume.shape[1:],
+        rmax=args.prompt_perturb_rmax,
+        seed=args.seed,
+    )
     if len(prompts) == 0:
         raise ValueError("No valid GT-positive prompt slices found")
 
@@ -907,6 +1131,13 @@ def predict_video(
     device: torch.device,
 ):
     prompts = extract_nodule_prompts_from_3d_mask(gt_volume)
+    prompts = perturb_3d_nodule_prompts(
+        prompts,
+        series_id=series_id,
+        image_shape_hw=gt_volume.shape[1:],
+        rmax=args.prompt_perturb_rmax,
+        seed=args.seed,
+    )
     if len(prompts) == 0:
         raise ValueError("No 3D connected nodules found in mask")
 
@@ -1004,6 +1235,17 @@ def parse_args() -> argparse.Namespace:
         help="Outputs for image-single/auto. For image-multi, auto is ignored.",
     )
     parser.add_argument("--use-triplet-channels", action="store_true", help="Use z-1/z/z+1 as RGB channels instead of duplicated slice.")
+    parser.add_argument(
+        "--prompt-perturb-rmax",
+        type=int,
+        default=0,
+        help=(
+            "Maximum absolute random perturbation in pixels for prompted point/box inputs. "
+            "For each prompt, dx and dy are sampled deterministically from [-rmax, +rmax]. "
+            "The shifted point and recentered box are shared by point, box, and point+box modes. "
+            "Use 0 to disable perturbations."
+        ),
+    )
 
     # Automatic mask options
     parser.add_argument("--process-all-slices-auto", action="store_true", help="Run automatic mask generator on all slices, not only GT-positive slices.")
@@ -1081,6 +1323,8 @@ def parse_args() -> argparse.Namespace:
             "a fixed --experiment-name."),)
 
     args = parser.parse_args()
+    if args.prompt_perturb_rmax < 0:
+        raise ValueError("--prompt-perturb-rmax must be >= 0")
     if args.mode == "auto":
         args.image_outputs = ["auto"]
     if args.mode == "image-multi":
@@ -1172,7 +1416,13 @@ def main():
             else:
                 raise ValueError(args.mode)
 
-            row.update({"status": "ok", "mask_file": Path(mask_path).name, "n_slices": int(gt_volume.shape[0]),})
+            row.update({
+                "status": "ok",
+                "mask_file": Path(mask_path).name,
+                "n_slices": int(gt_volume.shape[0]),
+                "prompt_perturb_rmax": int(args.prompt_perturb_rmax),
+                "prompt_perturb_seed": int(args.seed),
+            })
 
             rows.append(row)
 
