@@ -95,6 +95,13 @@ def build_experiment_name(args: argparse.Namespace):
     if getattr(args, "prompt_perturb_rmax", 0) > 0:
         perturb_tag = f"perturb-r{int(args.prompt_perturb_rmax)}"
 
+    box_size_tag = None
+    if getattr(args, "box_size_perturb_px", 0) != 0:
+        box_size_tag = (
+            f"boxsize-{int(args.box_size_perturb_px):+d}px"
+            f"-min{int(args.box_min_size_px)}"
+        )
+
     shard_tag = None
     if getattr(args, "shard_count", 1) > 1:
         shard_tag = f"shard-{args.shard_index}of{args.shard_count}"
@@ -121,6 +128,8 @@ def build_experiment_name(args: argparse.Namespace):
         parts.append(f"max-{args.max_cases}")
     if perturb_tag is not None:
         parts.append(perturb_tag)
+    if box_size_tag is not None:
+        parts.append(box_size_tag)
     if shard_tag is not None:
         parts.append(shard_tag)
     if auto_tag is not None:
@@ -354,6 +363,83 @@ def clip_box_xyxy(box_xyxy: np.ndarray, image_shape_hw: Tuple[int, int]) -> np.n
     box[..., 1] = np.clip(box[..., 1], 0, H - 1)
     box[..., 3] = np.clip(box[..., 3], 0, H - 1)
     return box
+
+
+def ensure_min_box_size_xyxy(
+    box_xyxy: Sequence[float],
+    image_shape_hw: Tuple[int, int],
+    min_size_px: int = 3,
+) -> np.ndarray:
+    """
+    Keep an xyxy box valid and enforce a minimum inclusive width/height.
+
+    For example, min_size_px=3 means x2 - x1 + 1 >= 3 and
+    y2 - y1 + 1 >= 3 whenever the image dimensions allow it.
+    """
+    H, W = image_shape_hw
+    min_size_px = max(1, int(min_size_px))
+    min_w = min(min_size_px, int(W))
+    min_h = min(min_size_px, int(H))
+
+    x1, y1, x2, y2 = clip_box_xyxy(
+        np.asarray(box_xyxy, dtype=np.float32).reshape(4),
+        image_shape_hw,
+    ).tolist()
+
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+
+    if (x2 - x1 + 1.0) < min_w:
+        cx = 0.5 * (x1 + x2)
+        half = 0.5 * (min_w - 1)
+        x1 = cx - half
+        x2 = cx + half
+        if x1 < 0:
+            x2 -= x1
+            x1 = 0.0
+        if x2 > W - 1:
+            x1 -= x2 - (W - 1)
+            x2 = float(W - 1)
+        x1 = max(0.0, x1)
+
+    if (y2 - y1 + 1.0) < min_h:
+        cy = 0.5 * (y1 + y2)
+        half = 0.5 * (min_h - 1)
+        y1 = cy - half
+        y2 = cy + half
+        if y1 < 0:
+            y2 -= y1
+            y1 = 0.0
+        if y2 > H - 1:
+            y1 -= y2 - (H - 1)
+            y2 = float(H - 1)
+        y1 = max(0.0, y1)
+
+    return clip_box_xyxy(np.array([x1, y1, x2, y2], dtype=np.float32), image_shape_hw)
+
+
+def resize_box_xyxy(
+    box_xyxy: Sequence[float],
+    image_shape_hw: Tuple[int, int],
+    delta_px: int = 0,
+    min_size_px: int = 3,
+) -> np.ndarray:
+    """
+    Resize a prompt box by delta_px in every direction.
+
+    delta_px = 0 keeps the original box.
+    delta_px > 0 expands the box.
+    delta_px < 0 shrinks the box.
+
+    The returned box is clipped to the image and kept at least min_size_px
+    pixels wide/high whenever possible.
+    """
+    x1, y1, x2, y2 = np.asarray(box_xyxy, dtype=np.float32).reshape(4).tolist()
+    d = int(delta_px)
+    resized = np.array([x1 - d, y1 - d, x2 + d, y2 + d], dtype=np.float32)
+    return ensure_min_box_size_xyxy(resized, image_shape_hw, min_size_px=min_size_px)
 
 
 def recenter_box_xyxy_at_point(
@@ -597,10 +683,15 @@ def get_interior_point(component_mask: np.ndarray) -> List[float]:
     return [float(x), float(y)]
 
 
-def extract_blobs_from_slice(mask_2d: np.ndarray) -> List[Dict]:
+def extract_blobs_from_slice(
+    mask_2d: np.ndarray,
+    box_size_perturb_px: int = 0,
+    box_min_size_px: int = 3,
+) -> List[Dict]:
     mask_bin = (mask_2d > 0).astype(np.uint8)
     contours, _ = cv2.findContours(mask_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     blobs = []
+    H, W = mask_bin.shape
     for contour in contours:
         if contour is None or len(contour) == 0:
             continue
@@ -612,7 +703,12 @@ def extract_blobs_from_slice(mask_2d: np.ndarray) -> List[Dict]:
         blobs.append(
             {
                 "center": get_interior_point(component_mask),
-                "bbox": [int(x), int(y), int(x + w - 1), int(y + h - 1)],
+                "bbox": resize_box_xyxy(
+                    [int(x), int(y), int(x + w - 1), int(y + h - 1)],
+                    image_shape_hw=(H, W),
+                    delta_px=box_size_perturb_px,
+                    min_size_px=box_min_size_px,
+                ).astype(np.float32).tolist(),
                 "component_mask": component_mask,
                 "contour": contour,
             }
@@ -622,14 +718,22 @@ def extract_blobs_from_slice(mask_2d: np.ndarray) -> List[Dict]:
     return blobs
 
 
-def build_slice_prompt_dict(mask_3d: np.ndarray) -> List[Dict]:
+def build_slice_prompt_dict(
+    mask_3d: np.ndarray,
+    box_size_perturb_px: int = 0,
+    box_min_size_px: int = 3,
+) -> List[Dict]:
     mask_3d = (mask_3d > 0).astype(np.uint8)
     slice_dicts = []
     for z in range(mask_3d.shape[0]):
         mask_slice = mask_3d[z]
         if not np.any(mask_slice > 0):
             continue
-        blobs = extract_blobs_from_slice(mask_slice)
+        blobs = extract_blobs_from_slice(
+            mask_slice,
+            box_size_perturb_px=box_size_perturb_px,
+            box_min_size_px=box_min_size_px,
+        )
         if not blobs:
             continue
         slice_dicts.append(
@@ -662,7 +766,11 @@ def get_bbox_from_2d_mask(mask_2d: np.ndarray) -> Optional[np.ndarray]:
     return np.array([xs.min(), ys.min(), xs.max(), ys.max()], dtype=np.float32)
 
 
-def extract_nodule_prompts_from_3d_mask(mask_zyx: np.ndarray) -> List[Dict]:
+def extract_nodule_prompts_from_3d_mask(
+    mask_zyx: np.ndarray,
+    box_size_perturb_px: int = 0,
+    box_min_size_px: int = 3,
+) -> List[Dict]:
     labeled, num = get_3d_connected_components(mask_zyx)
     prompts = []
     obj_id = 1
@@ -674,6 +782,12 @@ def extract_nodule_prompts_from_3d_mask(mask_zyx: np.ndarray) -> List[Dict]:
         box_xyxy = get_bbox_from_2d_mask(comp[z].astype(np.uint8))
         if box_xyxy is None:
             continue
+        box_xyxy = resize_box_xyxy(
+            box_xyxy,
+            image_shape_hw=mask_zyx.shape[1:],
+            delta_px=box_size_perturb_px,
+            min_size_px=box_min_size_px,
+        )
         prompts.append(
             {
                 "obj_id": obj_id,
@@ -908,7 +1022,11 @@ def predict_image_single(
     args: argparse.Namespace,
     device: torch.device,
 ):
-    prompts = build_slice_prompt_dict(gt_volume)
+    prompts = build_slice_prompt_dict(
+        gt_volume,
+        box_size_perturb_px=args.box_size_perturb_px,
+        box_min_size_px=args.box_min_size_px,
+    )
     prompts = perturb_slice_prompt_dicts(
         prompts,
         series_id=series_id,
@@ -1004,7 +1122,11 @@ def predict_image_multi(
     args: argparse.Namespace,
     device: torch.device,
 ):
-    prompts = build_slice_prompt_dict(gt_volume)
+    prompts = build_slice_prompt_dict(
+        gt_volume,
+        box_size_perturb_px=args.box_size_perturb_px,
+        box_min_size_px=args.box_min_size_px,
+    )
     prompts = perturb_slice_prompt_dicts(
         prompts,
         series_id=series_id,
@@ -1130,7 +1252,11 @@ def predict_video(
     args: argparse.Namespace,
     device: torch.device,
 ):
-    prompts = extract_nodule_prompts_from_3d_mask(gt_volume)
+    prompts = extract_nodule_prompts_from_3d_mask(
+        gt_volume,
+        box_size_perturb_px=args.box_size_perturb_px,
+        box_min_size_px=args.box_min_size_px,
+    )
     prompts = perturb_3d_nodule_prompts(
         prompts,
         series_id=series_id,
@@ -1246,6 +1372,25 @@ def parse_args() -> argparse.Namespace:
             "Use 0 to disable perturbations."
         ),
     )
+    parser.add_argument(
+        "--box-size-perturb-px",
+        type=int,
+        default=0,
+        help=(
+            "Resize prompt boxes by this many pixels in every direction before inference. "
+            "0 keeps the original mask-derived box, positive values enlarge it, and "
+            "negative values shrink it."
+        ),
+    )
+    parser.add_argument(
+        "--box-min-size-px",
+        type=int,
+        default=3,
+        help=(
+            "Minimum inclusive side length for prompt boxes after box-size perturbation. "
+            "This prevents negative or too-small boxes when using negative perturbations."
+        ),
+    )
 
     # Automatic mask options
     parser.add_argument("--process-all-slices-auto", action="store_true", help="Run automatic mask generator on all slices, not only GT-positive slices.")
@@ -1325,6 +1470,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.prompt_perturb_rmax < 0:
         raise ValueError("--prompt-perturb-rmax must be >= 0")
+    if args.box_min_size_px < 1:
+        raise ValueError("--box-min-size-px must be >= 1")
     if args.mode == "auto":
         args.image_outputs = ["auto"]
     if args.mode == "image-multi":
@@ -1422,6 +1569,8 @@ def main():
                 "n_slices": int(gt_volume.shape[0]),
                 "prompt_perturb_rmax": int(args.prompt_perturb_rmax),
                 "prompt_perturb_seed": int(args.seed),
+                "box_size_perturb_px": int(args.box_size_perturb_px),
+                "box_min_size_px": int(args.box_min_size_px),
             })
 
             rows.append(row)
