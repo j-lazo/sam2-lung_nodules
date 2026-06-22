@@ -616,6 +616,128 @@ def load_case(index: DatasetIndex, series_id: str) -> Optional[CaseData]:
 
 
 # =============================================================================
+# Train/val/test split utilities
+# =============================================================================
+
+def read_case_list_file(path: Optional[str]) -> Optional[List[str]]:
+    """Read one SeriesUID per line. Empty lines and comments are ignored."""
+    if path is None:
+        return None
+    ids: List[str] = []
+    for line in Path(path).expanduser().read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.endswith(".mhd"):
+            line = line[:-4]
+        ids.append(line)
+    return ids
+
+
+def write_case_list_file(path: Path, ids: Sequence[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(str(x) for x in ids) + ("\n" if ids else ""))
+
+
+def split_volume_ids(
+    volume_ids: Sequence[str],
+    seed: int,
+    val_ratio: float = 0.10,
+    test_ratio: float = 0.0,
+    train_case_list: Optional[str] = None,
+    val_case_list: Optional[str] = None,
+    test_case_list: Optional[str] = None,
+    shuffle_splits: bool = True,
+) -> Dict[str, List[str]]:
+    """
+    Build explicit train/val/test volume splits by SeriesUID.
+
+    If any explicit split list is provided, those files define the split. Missing
+    train list means "all remaining volumes not listed in val/test".
+    Otherwise, ratios are applied after deterministic shuffling.
+    """
+    available = list(volume_ids)
+    available_set = set(available)
+
+    explicit_train = read_case_list_file(train_case_list)
+    explicit_val = read_case_list_file(val_case_list)
+    explicit_test = read_case_list_file(test_case_list)
+    if explicit_train is not None or explicit_val is not None or explicit_test is not None:
+        val_ids = [x for x in (explicit_val or []) if x in available_set]
+        test_ids = [x for x in (explicit_test or []) if x in available_set]
+        if explicit_train is None:
+            used_nontrain = set(val_ids) | set(test_ids)
+            train_ids = [x for x in available if x not in used_nontrain]
+        else:
+            train_ids = [x for x in explicit_train if x in available_set]
+
+        overlap = (set(train_ids) & set(val_ids)) | (set(train_ids) & set(test_ids)) | (set(val_ids) & set(test_ids))
+        if overlap:
+            raise ValueError(f"Explicit split files overlap for {len(overlap)} SeriesUIDs, e.g. {sorted(overlap)[:5]}")
+        used = set(train_ids) | set(val_ids) | set(test_ids)
+        return {"train": train_ids, "val": val_ids, "test": test_ids, "all": [x for x in available if x in used] if used else available}
+
+    if not (0.0 <= val_ratio < 1.0):
+        raise ValueError("--val-ratio must be in [0, 1)")
+    if not (0.0 <= test_ratio < 1.0):
+        raise ValueError("--test-ratio must be in [0, 1)")
+    if val_ratio + test_ratio >= 1.0:
+        raise ValueError("--val-ratio + --test-ratio must be < 1")
+
+    ids = list(available)
+    if shuffle_splits:
+        rng = np.random.default_rng(seed)
+        ids = list(rng.permutation(ids))
+
+    n_total = len(ids)
+    n_test = int(round(n_total * test_ratio))
+    n_val = int(round(n_total * val_ratio))
+    if n_total > 1 and val_ratio > 0 and n_val == 0:
+        n_val = 1
+    if n_total > 2 and test_ratio > 0 and n_test == 0:
+        n_test = 1
+    if n_val + n_test >= n_total and n_total > 0:
+        # Keep at least one train volume.
+        excess = n_val + n_test - (n_total - 1)
+        reduce_test = min(excess, n_test)
+        n_test -= reduce_test
+        excess -= reduce_test
+        n_val = max(0, n_val - excess)
+
+    test_ids = ids[:n_test]
+    val_ids = ids[n_test:n_test + n_val]
+    train_ids = ids[n_test + n_val:]
+    return {"train": train_ids, "val": val_ids, "test": test_ids, "all": ids}
+
+
+def write_split_files(splits: Dict[str, List[str]], out_dir: Path) -> None:
+    split_dir = out_dir / "splits"
+    for name in ["train", "val", "test", "all"]:
+        write_case_list_file(split_dir / f"{name}.txt", splits.get(name, []))
+
+
+def build_splits(index: DatasetIndex, args: argparse.Namespace) -> Dict[str, List[str]]:
+    return split_volume_ids(
+        index.volume_ids,
+        seed=args.seed,
+        val_ratio=getattr(args, "val_ratio", 0.10),
+        test_ratio=getattr(args, "test_ratio", 0.0),
+        train_case_list=getattr(args, "train_case_list", None),
+        val_case_list=getattr(args, "val_case_list", None),
+        test_case_list=getattr(args, "test_case_list", None),
+        shuffle_splits=getattr(args, "shuffle_splits", True),
+    )
+
+
+def select_eval_volume_ids(index: DatasetIndex, args: argparse.Namespace) -> List[str]:
+    splits = build_splits(index, args)
+    split_name = getattr(args, "eval_split", "all")
+    if split_name not in splits:
+        raise ValueError(f"Unknown --eval-split {split_name!r}; expected one of {sorted(splits)}")
+    return splits[split_name]
+
+
+# =============================================================================
 # Mask/object utilities
 # =============================================================================
 
@@ -800,6 +922,7 @@ class LUNASliceDetectorDataset(Dataset):
         min_component_area: int,
         output_stride_hint: int = 16,
         cache_cases: bool = False,
+        volume_ids_override: Optional[Sequence[str]] = None,
     ):
         self.index = index
         self.split = split
@@ -812,18 +935,15 @@ class LUNASliceDetectorDataset(Dataset):
         self.cache_cases = cache_cases
         self._case_cache: Dict[str, CaseData] = {}
 
-        ids = list(index.volume_ids)
-        rng = np.random.default_rng(seed)
-        ids = list(rng.permutation(ids))
-        n_val = max(1, int(round(len(ids) * val_ratio))) if len(ids) > 1 else 0
-        if split == "val":
-            self.volume_ids = ids[:n_val]
-        elif split == "train":
-            self.volume_ids = ids[n_val:]
-        elif split == "all":
-            self.volume_ids = ids
+        if volume_ids_override is not None:
+            self.volume_ids = list(volume_ids_override)
         else:
-            raise ValueError(split)
+            # Backward-compatible fallback if dataset is constructed directly.
+            splits = split_volume_ids(index.volume_ids, seed=seed, val_ratio=val_ratio, test_ratio=0.0)
+            if split in splits:
+                self.volume_ids = splits[split]
+            else:
+                raise ValueError(split)
 
         self.samples = self._build_samples(
             seed=seed,
@@ -1320,6 +1440,9 @@ def train_detector(args: argparse.Namespace) -> None:
     configure_torch(device, args.allow_tf32)
     out_dir = make_output_dir(args, "train-detector")
     index = build_dataset_index(args)
+    splits = build_splits(index, args)
+    write_split_files(splits, out_dir)
+    print(f"Split sizes: train={len(splits['train'])}, val={len(splits['val'])}, test={len(splits['test'])}, all={len(splits['all'])}")
     save_config(args, out_dir, "train-detector", index)
 
     train_ds = LUNASliceDetectorDataset(
@@ -1327,6 +1450,7 @@ def train_detector(args: argparse.Namespace) -> None:
         split="train",
         val_ratio=args.val_ratio,
         seed=args.seed,
+        volume_ids_override=splits["train"],
         positive_fraction=args.positive_fraction,
         neighbor_slices=args.neighbor_slices,
         max_negative_slices_per_case=args.max_negative_slices_per_case,
@@ -1342,6 +1466,7 @@ def train_detector(args: argparse.Namespace) -> None:
         split="val",
         val_ratio=args.val_ratio,
         seed=args.seed,
+        volume_ids_override=splits["val"] if splits["val"] else splits["train"],
         positive_fraction=args.positive_fraction,
         neighbor_slices=args.neighbor_slices,
         max_negative_slices_per_case=args.max_negative_slices_per_case,
@@ -1568,9 +1693,11 @@ def infer_detector(args: argparse.Namespace) -> None:
     load_detector_checkpoint(model, args.detector_checkpoint, device)
     model.eval()
 
+    eval_volume_ids = select_eval_volume_ids(index, args)
+    print(f"Evaluating split={args.eval_split} with {len(eval_volume_ids)} volumes")
     candidates_by_case: Dict[str, List[Candidate]] = {}
     rows = []
-    for series_id in tqdm(index.volume_ids, desc="cases"):
+    for series_id in tqdm(eval_volume_ids, desc="cases"):
         case = load_case(index, series_id)
         if case is None:
             rows.append({"VolumeID": series_id, "status": "missing"})
@@ -1670,8 +1797,10 @@ def infer_detect_sam2(args: argparse.Namespace) -> None:
     prompt_rows = []
     nodule_rows = []
     pred_root = out_dir / "predicted_volumes"
+    eval_volume_ids = select_eval_volume_ids(index, args)
+    print(f"Evaluating split={args.eval_split} with {len(eval_volume_ids)} volumes")
 
-    for series_id in tqdm(index.volume_ids, desc="cases"):
+    for series_id in tqdm(eval_volume_ids, desc="cases"):
         try:
             case = load_case(index, series_id)
             if case is None:
@@ -1731,11 +1860,18 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--masks-dir", default=None)
     parser.add_argument("--annotations-csv", default=None)
     parser.add_argument("--links-csv", default=None)
-    parser.add_argument("--case-list", default=None)
+    parser.add_argument("--case-list", default=None, help="Optional global case filter applied before train/val/test splitting.")
+    parser.add_argument("--train-case-list", default=None, help="Explicit train split SeriesUIDs, one per line.")
+    parser.add_argument("--val-case-list", default=None, help="Explicit validation split SeriesUIDs, one per line.")
+    parser.add_argument("--test-case-list", default=None, help="Explicit test split SeriesUIDs, one per line.")
+    parser.add_argument("--val-ratio", type=float, default=0.10, help="Validation volume ratio when explicit split files are not used.")
+    parser.add_argument("--test-ratio", type=float, default=0.10, help="Test volume ratio when explicit split files are not used.")
+    parser.add_argument("--eval-split", choices=["all", "train", "val", "test"], default="all", help="Split used by inference/evaluation commands.")
+    parser.add_argument("--shuffle-splits", action=argparse.BooleanOptionalAction, default=True, help="Shuffle before ratio-based train/val/test splitting.")
     parser.add_argument("--only-annotated", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dataset-fraction", type=float, default=None)
     parser.add_argument("--max-cases", type=int, default=None)
-    parser.add_argument("--shuffle", action="store_true")
+    parser.add_argument("--shuffle", action="store_true", help="Shuffle global case order before optional dataset_fraction/max_cases filtering.")
     parser.add_argument("--seed", type=int, default=123)
 
     parser.add_argument("--model-cfg", required=True)
@@ -1770,7 +1906,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--batch-size", type=int, default=8)
     p_train.add_argument("--lr", type=float, default=1e-4)
     p_train.add_argument("--weight-decay", type=float, default=1e-4)
-    p_train.add_argument("--val-ratio", type=float, default=0.10)
     p_train.add_argument("--positive-fraction", type=float, default=0.50)
     p_train.add_argument("--neighbor-slices", type=int, default=2)
     p_train.add_argument("--max-negative-slices-per-case", type=int, default=20)
@@ -1809,9 +1944,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def validate_args(args: argparse.Namespace) -> None:
+    if not (0.0 <= args.val_ratio < 1.0):
+        raise ValueError("--val-ratio must be in [0, 1)")
+    if not (0.0 <= args.test_ratio < 1.0):
+        raise ValueError("--test-ratio must be in [0, 1)")
+    if args.val_ratio + args.test_ratio >= 1.0 and not (args.train_case_list or args.val_case_list or args.test_case_list):
+        raise ValueError("Need --val-ratio + --test-ratio < 1 unless explicit split files are used")
+
+
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
+    validate_args(args)
     if args.command == "train-detector":
         train_detector(args)
     elif args.command == "infer-detector":
