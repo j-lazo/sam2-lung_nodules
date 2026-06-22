@@ -18,10 +18,6 @@ SAM2-based LUNA16 segmentation:
    Run detector first, convert top candidates to point+box prompts, then run the
    frozen SAM2 image predictor slice-wise to produce a 3D mask volume.
 
-4) infer-detect-sam2-video
-   Run detector first, use the best candidate prompts as SAM2 video prompts, and
-   propagate masks forward/backward through the CT volume treated as a video.
-
 Assumptions
 -----------
 - You run this from the SAM2 repository root, or have SAM2 importable.
@@ -88,7 +84,7 @@ from scipy import ndimage
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from sam2.build_sam import build_sam2, build_sam2_video_predictor
+from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
 
@@ -146,6 +142,295 @@ def write_pred_volume(pred: np.ndarray, reference_image: sitk.Image, out_path: P
     img.CopyInformation(reference_image)
     sitk.WriteImage(img, str(out_path))
 
+
+
+def binary_confusion_counts(gt: np.ndarray, pred: np.ndarray) -> Tuple[int, int, int, int]:
+    gt_b = gt.astype(bool)
+    pred_b = pred.astype(bool)
+    tp = int(np.logical_and(gt_b, pred_b).sum())
+    fp = int(np.logical_and(~gt_b, pred_b).sum())
+    fn = int(np.logical_and(gt_b, ~pred_b).sum())
+    tn = int(np.logical_and(~gt_b, ~pred_b).sum())
+    return tp, fp, fn, tn
+
+
+def iou_score(gt: np.ndarray, pred: np.ndarray, smooth: float = 1e-6) -> float:
+    gt_b = gt.astype(bool)
+    pred_b = pred.astype(bool)
+    inter = np.logical_and(gt_b, pred_b).sum(dtype=np.float64)
+    union = np.logical_or(gt_b, pred_b).sum(dtype=np.float64)
+    return float((inter + smooth) / (union + smooth))
+
+
+def precision_recall_f1(gt: np.ndarray, pred: np.ndarray, smooth: float = 1e-6) -> Dict[str, float]:
+    tp, fp, fn, tn = binary_confusion_counts(gt, pred)
+    precision = float((tp + smooth) / (tp + fp + smooth))
+    recall = float((tp + smooth) / (tp + fn + smooth))
+    f1 = float((2.0 * precision * recall + smooth) / (precision + recall + smooth))
+    return {"precision": precision, "recall": recall, "f1": f1, "tp": tp, "fp": fp, "fn": fn, "tn": tn}
+
+
+def _surface(mask: np.ndarray) -> np.ndarray:
+    mask = mask.astype(bool)
+    if not mask.any():
+        return mask
+    structure = ndimage.generate_binary_structure(mask.ndim, 1)
+    eroded = ndimage.binary_erosion(mask, structure=structure, border_value=0)
+    return np.logical_and(mask, ~eroded)
+
+
+def surface_distances_mm(mask_a: np.ndarray, mask_b: np.ndarray, spacing_zyx: Tuple[float, float, float]) -> np.ndarray:
+    a = mask_a.astype(bool)
+    b = mask_b.astype(bool)
+    if not a.any() or not b.any():
+        return np.array([], dtype=np.float32)
+    surf_a = _surface(a)
+    surf_b = _surface(b)
+    dt_b = ndimage.distance_transform_edt(~surf_b, sampling=spacing_zyx)
+    dt_a = ndimage.distance_transform_edt(~surf_a, sampling=spacing_zyx)
+    d_ab = dt_b[surf_a]
+    d_ba = dt_a[surf_b]
+    return np.concatenate([d_ab, d_ba]).astype(np.float32)
+
+
+def hd95_mm(gt: np.ndarray, pred: np.ndarray, spacing_zyx: Tuple[float, float, float]) -> float:
+    if not gt.astype(bool).any() and not pred.astype(bool).any():
+        return 0.0
+    if not gt.astype(bool).any() or not pred.astype(bool).any():
+        return float("nan")
+    d = surface_distances_mm(gt, pred, spacing_zyx)
+    return float(np.percentile(d, 95)) if d.size else float("nan")
+
+
+def assd_mm(gt: np.ndarray, pred: np.ndarray, spacing_zyx: Tuple[float, float, float]) -> float:
+    if not gt.astype(bool).any() and not pred.astype(bool).any():
+        return 0.0
+    if not gt.astype(bool).any() or not pred.astype(bool).any():
+        return float("nan")
+    d = surface_distances_mm(gt, pred, spacing_zyx)
+    return float(np.mean(d)) if d.size else float("nan")
+
+
+def volume_similarity(gt: np.ndarray, pred: np.ndarray, smooth: float = 1e-6) -> float:
+    g = float(gt.astype(bool).sum())
+    p = float(pred.astype(bool).sum())
+    return float(1.0 - abs(p - g) / (p + g + smooth))
+
+
+def get_spacing_zyx(image_itk: sitk.Image) -> Tuple[float, float, float]:
+    sx, sy, sz = image_itk.GetSpacing()
+    return float(sz), float(sy), float(sx)
+
+
+def segmentation_metrics(gt: np.ndarray, pred: np.ndarray, spacing_zyx: Tuple[float, float, float]) -> Dict[str, float]:
+    pr = precision_recall_f1(gt, pred)
+    return {
+        "DSC": dice_score(gt, pred),
+        "IoU": iou_score(gt, pred),
+        "seg_precision": pr["precision"],
+        "seg_recall": pr["recall"],
+        "seg_f1": pr["f1"],
+        "HD95_mm": hd95_mm(gt, pred, spacing_zyx),
+        "ASSD_mm": assd_mm(gt, pred, spacing_zyx),
+        "volume_similarity": volume_similarity(gt, pred),
+        "pred_voxels": int(pred.astype(bool).sum()),
+        "gt_voxels": int(gt.astype(bool).sum()),
+    }
+
+
+def extract_gt_nodules_3d(gt_volume: np.ndarray, spacing_zyx: Tuple[float, float, float], min_area: int = 1) -> List[Dict]:
+    labeled, num = ndimage.label(gt_volume.astype(bool), structure=ndimage.generate_binary_structure(3, 2))
+    nodules: List[Dict] = []
+    voxel_volume = float(spacing_zyx[0] * spacing_zyx[1] * spacing_zyx[2])
+    for k in range(1, num + 1):
+        comp = labeled == k
+        vox = int(comp.sum())
+        if vox < min_area:
+            continue
+        coords = np.argwhere(comp)
+        zmin, ymin, xmin = coords.min(axis=0)
+        zmax, ymax, xmax = coords.max(axis=0)
+        center = coords.mean(axis=0)  # z,y,x in voxels
+        extent_vox = np.array([zmax - zmin + 1, ymax - ymin + 1, xmax - xmin + 1], dtype=np.float32)
+        extent_mm = extent_vox * np.array(spacing_zyx, dtype=np.float32)
+        eq_diam_mm = float((6.0 * vox * voxel_volume / np.pi) ** (1.0 / 3.0))
+        nodules.append({
+            "nodule_id": int(k),
+            "mask": comp.astype(np.uint8),
+            "center_zyx": center.astype(np.float32),
+            "bbox_zyx": [int(zmin), int(ymin), int(xmin), int(zmax), int(ymax), int(xmax)],
+            "gt_volume_voxels": vox,
+            "gt_volume_mm3": float(vox * voxel_volume),
+            "gt_diameter_vox": float(max(extent_vox)),
+            "gt_diameter_mm": float(max(extent_mm)),
+            "gt_equivalent_diameter_mm": eq_diam_mm,
+        })
+    nodules.sort(key=lambda n: n["nodule_id"])
+    return nodules
+
+
+def candidate_fields(c) -> Tuple[float, float, float, float, Optional[np.ndarray]]:
+    z = float(getattr(c, "z"))
+    y = float(getattr(c, "y"))
+    x = float(getattr(c, "x"))
+    score = float(getattr(c, "score", np.nan))
+    box = getattr(c, "box", None)
+    if box is None:
+        box = getattr(c, "box_xyxy", None)
+    return z, y, x, score, None if box is None else np.asarray(box, dtype=np.float32)
+
+
+def center_error(c, nodule: Dict, spacing_zyx: Tuple[float, float, float]) -> Tuple[float, float, int]:
+    z, y, x, score, _ = candidate_fields(c)
+    center = nodule["center_zyx"]
+    dz, dy, dx = z - float(center[0]), y - float(center[1]), x - float(center[2])
+    err_vox = float(np.sqrt(dz * dz + dy * dy + dx * dx))
+    err_mm = float(np.sqrt((dz * spacing_zyx[0]) ** 2 + (dy * spacing_zyx[1]) ** 2 + (dx * spacing_zyx[2]) ** 2))
+    return err_vox, err_mm, int(round(abs(dz)))
+
+
+def match_candidates_to_gt(gt_volume: np.ndarray, candidates: List, spacing_zyx: Tuple[float, float, float], min_area: int = 1) -> Tuple[List[Dict], List[Dict], List[int]]:
+    nodules = extract_gt_nodules_3d(gt_volume, spacing_zyx, min_area=min_area)
+    matches: List[Dict] = []
+    used = set()
+    for ni, n in enumerate(nodules):
+        best = None
+        for ci, c in enumerate(candidates):
+            if ci in used:
+                continue
+            ev, em, ez = center_error(c, n, spacing_zyx)
+            radius_vox = max(2.0, 0.5 * float(n["gt_diameter_vox"]))
+            radius_mm = max(2.0, 0.5 * float(n["gt_diameter_mm"]))
+            if ev <= radius_vox or em <= radius_mm:
+                z, y, x, score, box = candidate_fields(c)
+                item = {"gt_index": ni, "cand_index": ci, "center_error_vox": ev, "center_error_mm": em, "slice_error": ez, "detector_confidence": score}
+                if best is None or item["center_error_mm"] < best["center_error_mm"]:
+                    best = item
+        if best is not None:
+            used.add(best["cand_index"])
+            matches.append(best)
+    unmatched_gt = [i for i in range(len(nodules)) if i not in {m["gt_index"] for m in matches}]
+    unmatched_cand = [i for i in range(len(candidates)) if i not in used]
+    return matches, nodules, unmatched_cand
+
+
+def detection_localization_metrics(gt_volume: np.ndarray, candidates: List, spacing_zyx: Tuple[float, float, float], min_area: int = 1) -> Dict[str, float]:
+    matches, nodules, unmatched_cand = match_candidates_to_gt(gt_volume, candidates, spacing_zyx, min_area=min_area)
+    tp = len(matches)
+    fn = max(0, len(nodules) - tp)
+    fp = len(unmatched_cand)
+    precision = float(tp / (tp + fp)) if (tp + fp) else 0.0
+    recall = float(tp / (tp + fn)) if (tp + fn) else 0.0
+    f1 = float(2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+    center_errs_mm = [m["center_error_mm"] for m in matches]
+    center_errs_vox = [m["center_error_vox"] for m in matches]
+    slice_errs = [m["slice_error"] for m in matches]
+    return {
+        "det_TP": tp,
+        "det_FP": fp,
+        "det_FN": fn,
+        "det_precision": precision,
+        "det_recall": recall,
+        "det_f1": f1,
+        "n_gt_nodules": len(nodules),
+        "n_candidates": len(candidates),
+        "mean_center_error_mm": float(np.mean(center_errs_mm)) if center_errs_mm else np.nan,
+        "median_center_error_mm": float(np.median(center_errs_mm)) if center_errs_mm else np.nan,
+        "mean_center_error_vox": float(np.mean(center_errs_vox)) if center_errs_vox else np.nan,
+        "mean_slice_error": float(np.mean(slice_errs)) if slice_errs else np.nan,
+        "best_det_score": float(max([candidate_fields(c)[3] for c in candidates], default=np.nan)),
+    }
+
+
+def per_nodule_metrics(case: CaseData, pred: Optional[np.ndarray], candidates: List, min_area: int = 1) -> List[Dict]:
+    spacing_zyx = get_spacing_zyx(case.image_itk)
+    matches, nodules, unmatched = match_candidates_to_gt(case.gt_volume, candidates, spacing_zyx, min_area=min_area)
+    match_by_gt = {m["gt_index"]: m for m in matches}
+    rows: List[Dict] = []
+    for i, n in enumerate(nodules):
+        gt_mask = n["mask"].astype(np.uint8)
+        m = match_by_gt.get(i)
+        if pred is None:
+            dsc = np.nan
+            hd = np.nan
+        else:
+            dsc = dice_score(gt_mask, pred)
+            hd = hd95_mm(gt_mask, pred, spacing_zyx)
+        row = {
+            "SeriesUID": case.series_id,
+            "nodule_id": n["nodule_id"],
+            "GT_diameter_vox": n["gt_diameter_vox"],
+            "GT_diameter_mm": n["gt_diameter_mm"],
+            "GT_equivalent_diameter_mm": n["gt_equivalent_diameter_mm"],
+            "GT_volume_voxels": n["gt_volume_voxels"],
+            "GT_volume_mm3": n["gt_volume_mm3"],
+            "Detector_confidence": m["detector_confidence"] if m else np.nan,
+            "Center_error_vox": m["center_error_vox"] if m else np.nan,
+            "Center_error_mm": m["center_error_mm"] if m else np.nan,
+            "Slice_error": m["slice_error"] if m else np.nan,
+            "Dice": dsc,
+            "HD95_mm": hd,
+            "detected": bool(m is not None),
+        }
+        rows.append(row)
+    return rows
+
+
+def summarize_detection_operating_points(volume_rows: List[Dict]) -> Dict[str, float]:
+    if not volume_rows:
+        return {}
+    total_tp = int(np.nansum([r.get("det_TP", 0) for r in volume_rows]))
+    total_fp = int(np.nansum([r.get("det_FP", 0) for r in volume_rows]))
+    total_fn = int(np.nansum([r.get("det_FN", 0) for r in volume_rows]))
+    n_scans = max(1, len([r for r in volume_rows if r.get("status") == "ok"]))
+    precision = float(total_tp / (total_tp + total_fp)) if (total_tp + total_fp) else 0.0
+    recall = float(total_tp / (total_tp + total_fn)) if (total_tp + total_fn) else 0.0
+    f1 = float(2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+    return {"overall_det_TP": total_tp, "overall_det_FP": total_fp, "overall_det_FN": total_fn, "overall_det_precision": precision, "overall_det_recall": recall, "overall_det_f1": f1, "FP_per_scan": float(total_fp / n_scans)}
+
+
+def save_detection_summary(rows: List[Dict], out_dir: Path) -> None:
+    summary = summarize_detection_operating_points(rows)
+    if summary:
+        pd.DataFrame([summary]).to_csv(out_dir / "detection_summary.csv", index=False)
+        with open(out_dir / "detection_summary.json", "w") as f:
+            json.dump(summary, f, indent=2)
+
+
+def plot_training_metrics(metrics_csv: Path, out_dir: Path) -> None:
+    if not metrics_csv.exists():
+        return
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"WARNING: could not import matplotlib for training plots: {exc}")
+        return
+    df = pd.read_csv(metrics_csv)
+    if df.empty or "epoch" not in df.columns:
+        return
+    numeric_cols = [c for c in df.columns if c != "epoch" and pd.api.types.is_numeric_dtype(df[c])]
+    if not numeric_cols:
+        return
+    loss_cols = [c for c in numeric_cols if "loss" in c.lower()]
+    metric_cols = [c for c in numeric_cols if c not in loss_cols and c != "lr"]
+    def _plot(cols: List[str], filename: str, title: str):
+        if not cols:
+            return
+        plt.figure(figsize=(10, 6))
+        for c in cols:
+            plt.plot(df["epoch"], df[c], marker="o", linewidth=1.5, label=c)
+        plt.xlabel("Epoch")
+        plt.ylabel("Value")
+        plt.title(title)
+        plt.grid(True, alpha=0.3)
+        plt.legend(loc="best", fontsize=8)
+        plt.tight_layout()
+        plt.savefig(out_dir / filename, dpi=200)
+        plt.close()
+    _plot(loss_cols, "training_validation_losses.png", "Training/validation losses")
+    _plot(metric_cols, "training_validation_metrics.png", "Training/validation metrics")
 
 def stable_uint32_seed(*items) -> int:
     payload = "::".join(str(x) for x in items).encode("utf-8")
@@ -327,110 +612,7 @@ def load_case(index: DatasetIndex, series_id: str) -> Optional[CaseData]:
     gt_volume = (sitk.GetArrayFromImage(mask_itk) >= 0.5).astype(np.uint8)
     if image_array.shape != gt_volume.shape:
         raise ValueError(f"Shape mismatch for {series_id}: image {image_array.shape}, mask {gt_volume.shape}")
-
     return CaseData(series_id, image_itk, image_array, gt_volume, mask_path)
-
-
-def read_case_list_file(path: Optional[str]) -> Optional[List[str]]:
-    if path is None:
-        return None
-    values = []
-    for line in Path(path).expanduser().read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.endswith(".mhd"):
-            line = line[:-4]
-        values.append(line)
-    return values
-
-
-def write_case_list_file(path: Path, ids: Sequence[str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(str(x) for x in ids) + ("\n" if ids else ""))
-
-
-def split_volume_ids(
-    volume_ids: Sequence[str],
-    seed: int,
-    val_ratio: float = 0.10,
-    test_ratio: float = 0.0,
-    train_case_list: Optional[str] = None,
-    val_case_list: Optional[str] = None,
-    test_case_list: Optional[str] = None,
-) -> Dict[str, List[str]]:
-    """
-    Build explicit train/val/test volume splits by series_id.
-
-    If any explicit split list is provided, only those files define the split.
-    Otherwise, ratios are applied after deterministic shuffling.
-    """
-    available = list(volume_ids)
-    available_set = set(available)
-
-    explicit_train = read_case_list_file(train_case_list)
-    explicit_val = read_case_list_file(val_case_list)
-    explicit_test = read_case_list_file(test_case_list)
-    if explicit_train is not None or explicit_val is not None or explicit_test is not None:
-        train_ids = [x for x in (explicit_train or []) if x in available_set]
-        val_ids = [x for x in (explicit_val or []) if x in available_set]
-        test_ids = [x for x in (explicit_test or []) if x in available_set]
-        used = set(train_ids) | set(val_ids) | set(test_ids)
-        overlap = (set(train_ids) & set(val_ids)) | (set(train_ids) & set(test_ids)) | (set(val_ids) & set(test_ids))
-        if overlap:
-            raise ValueError(f"Explicit split files overlap for {len(overlap)} series IDs, e.g. {sorted(overlap)[:5]}")
-        return {
-            "train": train_ids,
-            "val": val_ids,
-            "test": test_ids,
-            "all": [x for x in available if x in used] if used else available,
-        }
-
-    if not (0.0 <= val_ratio < 1.0):
-        raise ValueError("--val-ratio must be in [0, 1)")
-    if not (0.0 <= test_ratio < 1.0):
-        raise ValueError("--test-ratio must be in [0, 1)")
-    if val_ratio + test_ratio >= 1.0:
-        raise ValueError("--val-ratio + --test-ratio must be < 1")
-
-    rng = np.random.default_rng(seed)
-    ids = list(rng.permutation(available))
-    n_total = len(ids)
-    n_test = int(round(n_total * test_ratio))
-    n_val = int(round(n_total * val_ratio))
-    if n_total > 1 and val_ratio > 0 and n_val == 0:
-        n_val = 1
-    if n_total > 2 and test_ratio > 0 and n_test == 0:
-        n_test = 1
-    if n_val + n_test >= n_total and n_total > 0:
-        # Keep at least one train volume.
-        excess = n_val + n_test - (n_total - 1)
-        reduce_test = min(excess, n_test)
-        n_test -= reduce_test
-        excess -= reduce_test
-        n_val = max(0, n_val - excess)
-
-    test_ids = ids[:n_test]
-    val_ids = ids[n_test : n_test + n_val]
-    train_ids = ids[n_test + n_val :]
-    return {"train": train_ids, "val": val_ids, "test": test_ids, "all": ids}
-
-
-def select_eval_volume_ids(index: DatasetIndex, args: argparse.Namespace) -> List[str]:
-    """Choose the volume IDs used by inference/evaluation commands."""
-    split_name = getattr(args, "eval_split", "all")
-    splits = split_volume_ids(
-        index.volume_ids,
-        seed=args.seed,
-        val_ratio=getattr(args, "val_ratio", 0.10),
-        test_ratio=getattr(args, "test_ratio", 0.0),
-        train_case_list=getattr(args, "train_case_list", None),
-        val_case_list=getattr(args, "val_case_list", None),
-        test_case_list=getattr(args, "test_case_list", None),
-    )
-    if split_name not in splits:
-        raise ValueError(f"Unknown --eval-split {split_name!r}; expected one of {sorted(splits)}")
-    return splits[split_name]
 
 
 # =============================================================================
@@ -616,8 +798,6 @@ class LUNASliceDetectorDataset(Dataset):
         hu_max: float,
         box_expand: float,
         min_component_area: int,
-        test_ratio: float = 0.0,
-        volume_ids_override: Optional[Sequence[str]] = None,
         output_stride_hint: int = 16,
         cache_cases: bool = False,
     ):
@@ -632,14 +812,18 @@ class LUNASliceDetectorDataset(Dataset):
         self.cache_cases = cache_cases
         self._case_cache: Dict[str, CaseData] = {}
 
-        if volume_ids_override is not None:
-            self.volume_ids = list(volume_ids_override)
+        ids = list(index.volume_ids)
+        rng = np.random.default_rng(seed)
+        ids = list(rng.permutation(ids))
+        n_val = max(1, int(round(len(ids) * val_ratio))) if len(ids) > 1 else 0
+        if split == "val":
+            self.volume_ids = ids[:n_val]
+        elif split == "train":
+            self.volume_ids = ids[n_val:]
+        elif split == "all":
+            self.volume_ids = ids
         else:
-            splits = split_volume_ids(index.volume_ids, seed=seed, val_ratio=val_ratio, test_ratio=test_ratio)
-            if split in splits:
-                self.volume_ids = splits[split]
-            else:
-                raise ValueError(split)
+            raise ValueError(split)
 
         self.samples = self._build_samples(
             seed=seed,
@@ -1012,7 +1196,19 @@ def make_output_dir(args: argparse.Namespace, command: str) -> Path:
     out = Path(args.output_dir).expanduser().resolve()
     if args.create_experiment_dir:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        name = args.experiment_name or f"{stamp}_{command}_sam2det_{'triplet' if args.use_triplet_channels else 'single'}"
+        triplet = "triplet" if getattr(args, "use_triplet_channels", False) else "singlech"
+        hdim = getattr(args, "detector_head_dim", "na")
+        bs = getattr(args, "batch_size", getattr(args, "eval_batch_size", "na"))
+        ep = getattr(args, "epochs", "na")
+        lr = str(getattr(args, "lr", "na")).replace(".", "p")
+        val = str(getattr(args, "val_ratio", "na")).replace(".", "p")
+        test = str(getattr(args, "test_ratio", "na")).replace(".", "p")
+        pos = str(getattr(args, "positive_fraction", "na")).replace(".", "p")
+        max_cases = getattr(args, "max_cases", None)
+        parts = [stamp, command, "sam2det2d", triplet, f"hd{hdim}", f"ep{ep}", f"bs{bs}", f"lr{lr}", f"val{val}", f"test{test}", f"pos{pos}"]
+        if max_cases is not None:
+            parts.append(f"max{max_cases}")
+        name = args.experiment_name or "_".join(map(str, parts))
         out = out / slugify(name)
     out.mkdir(parents=True, exist_ok=args.overwrite_experiment)
     return out
@@ -1124,19 +1320,6 @@ def train_detector(args: argparse.Namespace) -> None:
     configure_torch(device, args.allow_tf32)
     out_dir = make_output_dir(args, "train-detector")
     index = build_dataset_index(args)
-    splits = split_volume_ids(
-        index.volume_ids,
-        seed=args.seed,
-        val_ratio=args.val_ratio,
-        test_ratio=args.test_ratio,
-        train_case_list=args.train_case_list,
-        val_case_list=args.val_case_list,
-        test_case_list=args.test_case_list,
-    )
-    split_dir = out_dir / "splits"
-    for split_name, split_ids in splits.items():
-        write_case_list_file(split_dir / f"{split_name}.txt", split_ids)
-    print(f"Split sizes: train={len(splits['train'])}, val={len(splits['val'])}, test={len(splits['test'])}, all={len(splits['all'])}")
     save_config(args, out_dir, "train-detector", index)
 
     train_ds = LUNASliceDetectorDataset(
@@ -1144,8 +1327,6 @@ def train_detector(args: argparse.Namespace) -> None:
         split="train",
         val_ratio=args.val_ratio,
         seed=args.seed,
-        test_ratio=args.test_ratio,
-        volume_ids_override=splits["train"],
         positive_fraction=args.positive_fraction,
         neighbor_slices=args.neighbor_slices,
         max_negative_slices_per_case=args.max_negative_slices_per_case,
@@ -1161,8 +1342,6 @@ def train_detector(args: argparse.Namespace) -> None:
         split="val",
         val_ratio=args.val_ratio,
         seed=args.seed,
-        test_ratio=args.test_ratio,
-        volume_ids_override=splits["val"],
         positive_fraction=args.positive_fraction,
         neighbor_slices=args.neighbor_slices,
         max_negative_slices_per_case=args.max_negative_slices_per_case,
@@ -1253,6 +1432,7 @@ def train_detector(args: argparse.Namespace) -> None:
                 print(f"Early stopping after {bad_epochs} bad epochs.")
                 break
 
+    plot_training_metrics(out_dir / "metrics.csv", out_dir)
     print(f"Done. Best detector: {out_dir / 'best_detector.pt'}")
 
 
@@ -1388,20 +1568,21 @@ def infer_detector(args: argparse.Namespace) -> None:
     load_detector_checkpoint(model, args.detector_checkpoint, device)
     model.eval()
 
-    eval_volume_ids = select_eval_volume_ids(index, args)
-    print(f"Evaluating split={args.eval_split} with {len(eval_volume_ids)} volumes")
     candidates_by_case: Dict[str, List[Candidate]] = {}
     rows = []
-    for series_id in tqdm(eval_volume_ids, desc="cases"):
+    for series_id in tqdm(index.volume_ids, desc="cases"):
         case = load_case(index, series_id)
         if case is None:
             rows.append({"VolumeID": series_id, "status": "missing"})
             continue
         cands = run_detector_on_case(model, case, args, device)
         candidates_by_case[series_id] = cands
-        rows.append({"VolumeID": series_id, "status": "ok", "n_candidates": len(cands), "best_score": cands[0].score if cands else np.nan})
+        spacing_zyx = get_spacing_zyx(case.image_itk)
+        det_metrics = detection_localization_metrics(case.gt_volume, cands, spacing_zyx, min_area=args.min_component_area)
+        rows.append({"VolumeID": series_id, "status": "ok", **det_metrics})
     save_candidates_csv(candidates_by_case, out_dir / "candidates.csv")
     pd.DataFrame(rows).to_csv(out_dir / "summary.csv", index=False)
+    save_detection_summary(rows, out_dir)
     print(f"Saved: {out_dir / 'candidates.csv'}")
 
 
@@ -1487,11 +1668,10 @@ def infer_detect_sam2(args: argparse.Namespace) -> None:
 
     rows = []
     prompt_rows = []
+    nodule_rows = []
     pred_root = out_dir / "predicted_volumes"
-    eval_volume_ids = select_eval_volume_ids(index, args)
-    print(f"Evaluating split={args.eval_split} with {len(eval_volume_ids)} volumes")
 
-    for series_id in tqdm(eval_volume_ids, desc="cases"):
+    for series_id in tqdm(index.volume_ids, desc="cases"):
         try:
             case = load_case(index, series_id)
             if case is None:
@@ -1499,18 +1679,16 @@ def infer_detect_sam2(args: argparse.Namespace) -> None:
                 continue
             cands = run_detector_on_case(detector, case, args, device)
             pred, logs = merge_candidate_sam2_masks(case, cands, predictor, args, device)
-            dsc = dice_score(case.gt_volume, pred)
+            spacing_zyx = get_spacing_zyx(case.image_itk)
             row = {
                 "VolumeID": series_id,
                 "status": "ok",
-                "DSC": dsc,
-                "n_candidates": len(cands),
-                "best_det_score": cands[0].score if cands else np.nan,
-                "pred_voxels": int(pred.sum()),
-                "gt_voxels": int(case.gt_volume.sum()),
+                **detection_localization_metrics(case.gt_volume, cands, spacing_zyx, min_area=args.min_component_area),
+                **segmentation_metrics(case.gt_volume, pred, spacing_zyx),
             }
             rows.append(row)
             prompt_rows.extend(logs)
+            nodule_rows.extend(per_nodule_metrics(case, pred, cands, min_area=args.min_component_area))
             if args.save_volumes:
                 write_pred_volume(pred, case.image_itk, pred_root / "detect_sam2" / f"{series_id}_detect_sam2.nii.gz")
                 if args.save_gt_volume:
@@ -1523,6 +1701,8 @@ def infer_detect_sam2(args: argparse.Namespace) -> None:
         pd.DataFrame(rows).to_csv(out_dir / "metrics.csv", index=False)
         if prompt_rows:
             pd.DataFrame(prompt_rows).to_csv(out_dir / "prompt_logs.csv", index=False)
+        if nodule_rows:
+            pd.DataFrame(nodule_rows).to_csv(out_dir / "nodule_metrics.csv", index=False)
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -1531,288 +1711,10 @@ def infer_detect_sam2(args: argparse.Namespace) -> None:
     df.to_csv(out_dir / "metrics.csv", index=False)
     if prompt_rows:
         pd.DataFrame(prompt_rows).to_csv(out_dir / "prompt_logs.csv", index=False)
+    if nodule_rows:
+        pd.DataFrame(nodule_rows).to_csv(out_dir / "nodule_metrics.csv", index=False)
+    save_detection_summary(rows, out_dir)
     ok = df[df["status"] == "ok"]
-    print(f"Saved metrics: {out_dir / 'metrics.csv'}")
-    if len(ok) > 0:
-        print(f"Mean DSC: {pd.to_numeric(ok['DSC'], errors='coerce').mean():.6f}")
-
-
-# =============================================================================
-# SAM2 video propagation refinement
-# =============================================================================
-
-
-def write_volume_as_sam2_frames(
-    volume_zyx: np.ndarray,
-    out_dir: Path,
-    use_triplet_channels: bool,
-    hu_min: float,
-    hu_max: float,
-    frame_ext: str,
-) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for z in range(volume_zyx.shape[0]):
-        rgb = build_sam2_input_slice(
-            volume_zyx,
-            z,
-            use_triplet_channels=use_triplet_channels,
-            hu_min=hu_min,
-            hu_max=hu_max,
-        )
-        Image.fromarray(rgb).save(out_dir / f"{z:05d}{frame_ext}")
-
-
-def add_sam2_video_prompt(
-    predictor,
-    inference_state,
-    frame_idx: int,
-    obj_id: int,
-    prompt_mode: str,
-    point_xy: np.ndarray,
-    point_labels: np.ndarray,
-    box_xyxy: np.ndarray,
-):
-    if prompt_mode == "point":
-        return predictor.add_new_points_or_box(
-            inference_state=inference_state,
-            frame_idx=frame_idx,
-            obj_id=obj_id,
-            points=point_xy,
-            labels=point_labels,
-        )
-    if prompt_mode == "box":
-        return predictor.add_new_points_or_box(
-            inference_state=inference_state,
-            frame_idx=frame_idx,
-            obj_id=obj_id,
-            box=box_xyxy,
-        )
-    if prompt_mode == "point+box":
-        return predictor.add_new_points_or_box(
-            inference_state=inference_state,
-            frame_idx=frame_idx,
-            obj_id=obj_id,
-            points=point_xy,
-            labels=point_labels,
-            box=box_xyxy,
-        )
-    raise ValueError(prompt_mode)
-
-
-def propagate_sam2_video(
-    predictor,
-    inference_state,
-    pred_by_obj: Dict[int, np.ndarray],
-    reverse: bool,
-) -> None:
-    kwargs = {"reverse": True} if reverse else {}
-    try:
-        iterator = predictor.propagate_in_video(inference_state, **kwargs)
-    except TypeError:
-        if reverse:
-            print("WARNING: this SAM2 video predictor does not support reverse=True; skipping reverse propagation.")
-            return
-        iterator = predictor.propagate_in_video(inference_state)
-
-    for out_frame_idx, out_obj_ids, out_mask_logits in iterator:
-        for i, obj_id in enumerate(out_obj_ids):
-            obj_id_int = int(obj_id)
-            if obj_id_int not in pred_by_obj:
-                continue
-            mask_np = out_mask_logits[i].squeeze().float().cpu().numpy()
-            mask_bin = (mask_np > float(0.0)).astype(np.uint8)
-            pred_by_obj[obj_id_int][int(out_frame_idx)] |= mask_bin
-
-
-def merge_video_candidates(
-    candidates: List[Candidate],
-    z_merge_window: int,
-    xy_merge_dist: float,
-) -> List[Candidate]:
-    """
-    Reduce duplicate detector candidates before video prompting.
-
-    This is a lightweight 3D NMS: keep high-score candidates and suppress another
-    candidate if it is close in z and xy to an already kept candidate.
-    """
-    if not candidates:
-        return []
-    kept: List[Candidate] = []
-    for c in sorted(candidates, key=lambda x: x.score, reverse=True):
-        duplicate = False
-        for k in kept:
-            dz = abs(c.z - k.z)
-            dxy = math.sqrt((c.x - k.x) ** 2 + (c.y - k.y) ** 2)
-            if dz <= z_merge_window and dxy <= xy_merge_dist:
-                duplicate = True
-                break
-        if not duplicate:
-            kept.append(c)
-    return kept
-
-
-def segment_case_with_sam2_video(
-    case: CaseData,
-    candidates: List[Candidate],
-    video_predictor,
-    args: argparse.Namespace,
-    device: torch.device,
-) -> Tuple[np.ndarray, List[Dict]]:
-    Z, H, W = case.gt_volume.shape
-    pred_volume = np.zeros((Z, H, W), dtype=np.uint8)
-    logs: List[Dict] = []
-
-    prompt_candidates = merge_video_candidates(
-        candidates,
-        z_merge_window=args.video_prompt_z_merge_window,
-        xy_merge_dist=args.video_prompt_xy_merge_dist,
-    )
-    if args.max_video_prompts > 0:
-        prompt_candidates = prompt_candidates[: args.max_video_prompts]
-
-    if not prompt_candidates:
-        return pred_volume, logs
-
-    temp_parent = Path(args.frame_tmp_dir or os.environ.get("SLURM_TMPDIR") or tempfile.gettempdir())
-    temp_dir = Path(tempfile.mkdtemp(prefix=f"sam2video_{case.series_id}_", dir=str(temp_parent)))
-    try:
-        write_volume_as_sam2_frames(
-            case.image_array,
-            temp_dir,
-            use_triplet_channels=args.use_triplet_channels,
-            hu_min=args.hu_min,
-            hu_max=args.hu_max,
-            frame_ext=args.frame_ext,
-        )
-
-        with torch.inference_mode(), safe_autocast(device, args.amp_dtype):
-            inference_state = video_predictor.init_state(video_path=str(temp_dir))
-            if hasattr(video_predictor, "reset_state"):
-                video_predictor.reset_state(inference_state)
-
-            pred_by_obj: Dict[int, np.ndarray] = {}
-            for obj_id, c in enumerate(prompt_candidates, start=1):
-                point = np.array([[c.x, c.y]], dtype=np.float32)
-                labels = np.array([1], dtype=np.int32)
-                box = c.box.astype(np.float32)
-                add_sam2_video_prompt(
-                    predictor=video_predictor,
-                    inference_state=inference_state,
-                    frame_idx=int(c.z),
-                    obj_id=int(obj_id),
-                    prompt_mode=args.sam2_prompt_mode,
-                    point_xy=point,
-                    point_labels=labels,
-                    box_xyxy=box,
-                )
-                pred_by_obj[int(obj_id)] = np.zeros((Z, H, W), dtype=np.uint8)
-                logs.append(
-                    {
-                        "VolumeID": case.series_id,
-                        "obj_id": obj_id,
-                        "prompt_z": int(c.z),
-                        "det_score": float(c.score),
-                        "x": float(c.x),
-                        "y": float(c.y),
-                        "x1": float(c.box[0]),
-                        "y1": float(c.box[1]),
-                        "x2": float(c.box[2]),
-                        "y2": float(c.box[3]),
-                    }
-                )
-
-            propagate_sam2_video(video_predictor, inference_state, pred_by_obj, reverse=False)
-            if args.video_bidirectional:
-                propagate_sam2_video(video_predictor, inference_state, pred_by_obj, reverse=True)
-
-        for obj_id, obj_mask in pred_by_obj.items():
-            if args.min_video_object_voxels > 0 and int(obj_mask.sum()) < args.min_video_object_voxels:
-                for row in logs:
-                    if row.get("obj_id") == obj_id:
-                        row["kept"] = False
-                        row["object_voxels"] = int(obj_mask.sum())
-                continue
-            pred_volume |= obj_mask.astype(np.uint8)
-            for row in logs:
-                if row.get("obj_id") == obj_id:
-                    row["kept"] = True
-                    row["object_voxels"] = int(obj_mask.sum())
-
-        return pred_volume, logs
-    finally:
-        if args.cleanup_frames:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-def infer_detect_sam2_video(args: argparse.Namespace) -> None:
-    seed_everything(args.seed)
-    device = select_device(args.device)
-    configure_torch(device, args.allow_tf32)
-    out_dir = make_output_dir(args, "infer-detect-sam2-video")
-    index = build_dataset_index(args)
-    save_config(args, out_dir, "infer-detect-sam2-video", index)
-
-    detector = build_detector_model(args, device)
-    load_detector_checkpoint(detector, args.detector_checkpoint, device)
-    detector.eval()
-
-    video_predictor = build_sam2_video_predictor(
-        args.model_cfg,
-        args.checkpoint,
-        device=device,
-        vos_optimized=args.vos_optimized,
-    )
-
-    eval_volume_ids = select_eval_volume_ids(index, args)
-    print(f"Evaluating split={args.eval_split} with {len(eval_volume_ids)} volumes using SAM2 video propagation")
-
-    rows: List[Dict] = []
-    prompt_rows: List[Dict] = []
-    pred_root = out_dir / "predicted_volumes"
-
-    for series_id in tqdm(eval_volume_ids, desc="cases"):
-        try:
-            case = load_case(index, series_id)
-            if case is None:
-                rows.append({"VolumeID": series_id, "status": "missing"})
-                continue
-            cands = run_detector_on_case(detector, case, args, device)
-            pred, logs = segment_case_with_sam2_video(case, cands, video_predictor, args, device)
-            dsc = dice_score(case.gt_volume, pred)
-            rows.append(
-                {
-                    "VolumeID": series_id,
-                    "status": "ok",
-                    "DSC": dsc,
-                    "n_detector_candidates": len(cands),
-                    "n_video_prompts": len(logs),
-                    "best_det_score": cands[0].score if cands else np.nan,
-                    "pred_voxels": int(pred.sum()),
-                    "gt_voxels": int(case.gt_volume.sum()),
-                }
-            )
-            prompt_rows.extend(logs)
-            if args.save_volumes:
-                write_pred_volume(pred, case.image_itk, pred_root / "detect_sam2_video" / f"{series_id}_detect_sam2_video.nii.gz")
-                if args.save_gt_volume:
-                    write_pred_volume(case.gt_volume, case.image_itk, pred_root / "gt" / f"{series_id}_gt.nii.gz")
-        except Exception as exc:
-            if args.fail_fast:
-                raise
-            rows.append({"VolumeID": series_id, "status": "error", "error": repr(exc)})
-            print(f"ERROR {series_id}: {repr(exc)}")
-        pd.DataFrame(rows).to_csv(out_dir / "metrics.csv", index=False)
-        if prompt_rows:
-            pd.DataFrame(prompt_rows).to_csv(out_dir / "video_prompt_logs.csv", index=False)
-        gc.collect()
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-
-    df = pd.DataFrame(rows)
-    df.to_csv(out_dir / "metrics.csv", index=False)
-    if prompt_rows:
-        pd.DataFrame(prompt_rows).to_csv(out_dir / "video_prompt_logs.csv", index=False)
-    ok = df[df["status"] == "ok"] if "status" in df.columns else pd.DataFrame()
     print(f"Saved metrics: {out_dir / 'metrics.csv'}")
     if len(ok) > 0:
         print(f"Mean DSC: {pd.to_numeric(ok['DSC'], errors='coerce').mean():.6f}")
@@ -1829,13 +1731,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--masks-dir", default=None)
     parser.add_argument("--annotations-csv", default=None)
     parser.add_argument("--links-csv", default=None)
-    parser.add_argument("--case-list", default=None, help="Optional global case filter applied before train/val/test splitting.")
-    parser.add_argument("--train-case-list", default=None, help="Explicit train split series IDs, one per line.")
-    parser.add_argument("--val-case-list", default=None, help="Explicit validation split series IDs, one per line.")
-    parser.add_argument("--test-case-list", default=None, help="Explicit test split series IDs, one per line.")
-    parser.add_argument("--val-ratio", type=float, default=0.10, help="Validation volume ratio when explicit split files are not used.")
-    parser.add_argument("--test-ratio", type=float, default=0.0, help="Test volume ratio when explicit split files are not used.")
-    parser.add_argument("--eval-split", choices=["all", "train", "val", "test"], default="all", help="Split used by inference/evaluation commands.")
+    parser.add_argument("--case-list", default=None)
     parser.add_argument("--only-annotated", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dataset-fraction", type=float, default=None)
     parser.add_argument("--max-cases", type=int, default=None)
@@ -1849,7 +1745,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--allow-tf32", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--create-experiment-dir", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--create-experiment-dir", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--experiment-name", default=None)
     parser.add_argument("--overwrite-experiment", action="store_true")
 
@@ -1874,6 +1770,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--batch-size", type=int, default=8)
     p_train.add_argument("--lr", type=float, default=1e-4)
     p_train.add_argument("--weight-decay", type=float, default=1e-4)
+    p_train.add_argument("--val-ratio", type=float, default=0.10)
     p_train.add_argument("--positive-fraction", type=float, default=0.50)
     p_train.add_argument("--neighbor-slices", type=int, default=2)
     p_train.add_argument("--max-negative-slices-per-case", type=int, default=20)
@@ -1909,29 +1806,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_sam.add_argument("--save-gt-volume", action="store_true")
     p_sam.add_argument("--fail-fast", action="store_true")
 
-    p_vid = sub.add_parser("infer-detect-sam2-video", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    add_common_args(p_vid)
-    p_vid.add_argument("--detector-checkpoint", required=True)
-    p_vid.add_argument("--eval-batch-size", type=int, default=16)
-    p_vid.add_argument("--det-score-thresh", type=float, default=0.20)
-    p_vid.add_argument("--topk-per-slice", type=int, default=3)
-    p_vid.add_argument("--max-candidates-per-volume", type=int, default=20)
-    p_vid.add_argument("--nms-iou", type=float, default=0.30)
-    p_vid.add_argument("--eval-positive-slices-only", action="store_true")
-    p_vid.add_argument("--sam2-prompt-mode", choices=["point", "box", "point+box"], default="point+box")
-    p_vid.add_argument("--max-video-prompts", type=int, default=5, help="Max detector candidates converted to SAM2 video objects per volume. 0 means no limit after candidate filtering.")
-    p_vid.add_argument("--video-prompt-z-merge-window", type=int, default=3, help="Suppress duplicate video prompts within this many slices.")
-    p_vid.add_argument("--video-prompt-xy-merge-dist", type=float, default=12.0, help="Suppress duplicate video prompts within this xy pixel distance.")
-    p_vid.add_argument("--video-bidirectional", action=argparse.BooleanOptionalAction, default=True, help="Propagate masks forward and backward from detector prompt slices.")
-    p_vid.add_argument("--vos-optimized", action="store_true")
-    p_vid.add_argument("--frame-tmp-dir", default=None)
-    p_vid.add_argument("--frame-ext", choices=[".jpg", ".png"], default=".jpg")
-    p_vid.add_argument("--cleanup-frames", action=argparse.BooleanOptionalAction, default=True)
-    p_vid.add_argument("--min-video-object-voxels", type=int, default=3)
-    p_vid.add_argument("--save-volumes", action="store_true")
-    p_vid.add_argument("--save-gt-volume", action="store_true")
-    p_vid.add_argument("--fail-fast", action="store_true")
-
     return parser
 
 
@@ -1944,8 +1818,6 @@ def main() -> None:
         infer_detector(args)
     elif args.command == "infer-detect-sam2":
         infer_detect_sam2(args)
-    elif args.command == "infer-detect-sam2-video":
-        infer_detect_sam2_video(args)
     else:
         raise ValueError(args.command)
 
