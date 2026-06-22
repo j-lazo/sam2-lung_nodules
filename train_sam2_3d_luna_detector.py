@@ -1327,8 +1327,6 @@ def add_train_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--patience", type=int, default=10)
     p.add_argument("--min-delta", type=float, default=1e-5)
     p.add_argument("--cache-cases", action="store_true")
-    p.add_argument("--run-test-after-training", action=argparse.BooleanOptionalAction, default=True,
-                   help="After training, run infer-feature3d-sam2-video on the test split with both best_detector.pt and last_detector.pt.")
     p.add_argument("--post-train-save-volumes", action=argparse.BooleanOptionalAction, default=True,
                    help="Save predicted NIfTI volumes during automatic post-training test prediction.")
     p.add_argument("--post-train-save-gt-volume", action=argparse.BooleanOptionalAction, default=False,

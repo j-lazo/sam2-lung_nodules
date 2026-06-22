@@ -2058,7 +2058,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--post-train-sam2-multimask", action="store_true")
     p_train.add_argument("--post-train-min-sam2-mask-area", type=int, default=3)
     p_train.add_argument("--post-train-fail-fast", action="store_true")
-    p_train.add_argument("--run-test-after-training", action=argparse.BooleanOptionalAction, default=True, help="After training, automatically run detector-guided SAM2 prediction on the test split using best_detector.pt.")
     p_train.add_argument("--test-eval-batch-size", type=int, default=16, help="Batch size used by automatic post-training test prediction.")
     p_train.add_argument("--test-det-score-thresh", type=float, default=0.20, help="Detector score threshold for automatic post-training test prediction.")
     p_train.add_argument("--test-topk-per-slice", type=int, default=3, help="Top-k candidates per slice for automatic post-training test prediction.")
