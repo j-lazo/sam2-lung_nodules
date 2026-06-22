@@ -1434,6 +1434,133 @@ def load_detector_checkpoint(model: SAM2EncoderDetector, ckpt_path: str, device:
     return ckpt
 
 
+def run_test_prediction_after_training(args: argparse.Namespace, train_out_dir: Path) -> None:
+    """Run detector-guided SAM2 prediction on the saved test split after training."""
+    if not getattr(args, "run_test_after_training", True):
+        print("Skipping automatic test prediction because --no-run-test-after-training was used.")
+        return
+
+    best_ckpt = train_out_dir / "best_detector.pt"
+    if not best_ckpt.exists():
+        print(f"WARNING: {best_ckpt} does not exist; skipping automatic test prediction.")
+        return
+
+    test_list = train_out_dir / "splits" / "test.txt"
+    test_ids = read_case_list_file(str(test_list)) if test_list.exists() else []
+    if not test_ids:
+        print("WARNING: test split is empty; skipping automatic test prediction.")
+        return
+
+    test_args = argparse.Namespace(**vars(args))
+    test_args.command = "infer-detect-sam2"
+    test_args.detector_checkpoint = str(best_ckpt)
+    test_args.output_dir = str(train_out_dir / "test_predictions")
+    test_args.create_experiment_dir = False
+    test_args.overwrite_experiment = True
+    test_args.eval_split = "test"
+    test_args.train_case_list = str(train_out_dir / "splits" / "train.txt")
+    test_args.val_case_list = str(train_out_dir / "splits" / "val.txt")
+    test_args.test_case_list = str(test_list)
+
+    # Defaults for the inference-only arguments, unless the user provided training-time overrides.
+    test_args.eval_batch_size = getattr(args, "test_eval_batch_size", 16)
+    test_args.det_score_thresh = getattr(args, "test_det_score_thresh", 0.20)
+    test_args.topk_per_slice = getattr(args, "test_topk_per_slice", 3)
+    test_args.max_candidates_per_volume = getattr(args, "test_max_candidates_per_volume", 20)
+    test_args.nms_iou = getattr(args, "test_nms_iou", 0.30)
+    test_args.eval_positive_slices_only = getattr(args, "test_eval_positive_slices_only", False)
+    test_args.sam2_prompt_mode = getattr(args, "test_sam2_prompt_mode", "point+box")
+    test_args.sam2_multimask = getattr(args, "test_sam2_multimask", False)
+    test_args.min_sam2_mask_area = getattr(args, "test_min_sam2_mask_area", 3)
+    test_args.save_volumes = getattr(args, "test_save_volumes", True)
+    test_args.save_gt_volume = getattr(args, "test_save_gt_volume", False)
+    test_args.fail_fast = getattr(args, "test_fail_fast", False)
+
+    print(f"Running automatic test prediction on {len(test_ids)} test volumes. Output: {test_args.output_dir}")
+    infer_detect_sam2(test_args)
+
+
+
+def _post_train_common_infer_args_2d(args: argparse.Namespace, out_dir: Path, test_file: Path, ckpt_path: Path, output_dir: Path, command: str) -> argparse.Namespace:
+    """Build an inference Namespace for automatic post-training test evaluation."""
+    pred_args = argparse.Namespace(**vars(args))
+    pred_args.command = command
+    pred_args.detector_checkpoint = str(ckpt_path)
+    pred_args.output_dir = str(output_dir)
+    pred_args.create_experiment_dir = False
+    pred_args.overwrite_experiment = True
+    pred_args.eval_split = "test"
+    pred_args.train_case_list = str(out_dir / "splits" / "train.txt")
+    pred_args.val_case_list = str(out_dir / "splits" / "val.txt")
+    pred_args.test_case_list = str(test_file)
+
+    pred_args.eval_batch_size = int(getattr(args, "post_train_eval_batch_size", 16))
+    pred_args.det_score_thresh = float(getattr(args, "post_train_det_score_thresh", 0.20))
+    pred_args.topk_per_slice = int(getattr(args, "post_train_topk_per_slice", 3))
+    pred_args.max_candidates_per_volume = int(getattr(args, "post_train_max_candidates_per_volume", 20))
+    pred_args.nms_iou = float(getattr(args, "post_train_nms_iou", 0.30))
+    pred_args.eval_positive_slices_only = bool(getattr(args, "post_train_eval_positive_slices_only", False))
+    pred_args.fail_fast = bool(getattr(args, "post_train_fail_fast", False))
+    return pred_args
+
+
+def _copy_if_exists(src: Path, dst: Path) -> None:
+    if src.exists():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+
+
+def run_test_predictions_after_training(args: argparse.Namespace, out_dir: Path) -> None:
+    """
+    Run four automatic test evaluations after training:
+      1) best weights -> detector-only metrics/candidates
+      2) best weights -> detector+SAM2 segmentation metrics/volumes
+      3) last weights -> detector-only metrics/candidates
+      4) last weights -> detector+SAM2 segmentation metrics/volumes
+
+    Output layout:
+      test_predictions/{best_weights,last_weights}/detector/
+          detector_metrics.csv, candidates.csv, detection_summary.*
+      test_predictions/{best_weights,last_weights}/segmentation/
+          segmentation_metrics.csv, nodule_metrics.csv, predicted_volumes/
+    """
+    if not getattr(args, "run_test_after_training", True):
+        print("Skipping post-training test evaluations because --no-run-test-after-training was set.")
+        return
+    test_file = out_dir / "splits" / "test.txt"
+    if not test_file.exists() or not test_file.read_text().strip():
+        print("Skipping post-training test evaluations because the test split is empty.")
+        return
+
+    runs = [
+        ("best_weights", out_dir / "best_detector.pt"),
+        ("last_weights", out_dir / "last_detector.pt"),
+    ]
+
+    for tag, ckpt_path in runs:
+        if not ckpt_path.exists():
+            print(f"WARNING: skipping {tag}; checkpoint not found: {ckpt_path}")
+            continue
+
+        root = out_dir / "test_predictions" / tag
+        detector_dir = root / "detector"
+        segmentation_dir = root / "segmentation"
+
+        det_args = _post_train_common_infer_args_2d(args, out_dir, test_file, ckpt_path, detector_dir, "infer-detector")
+        print(f"Running post-training DETECTOR test evaluation with {tag}: {ckpt_path}")
+        infer_detector(det_args)
+        _copy_if_exists(detector_dir / "summary.csv", detector_dir / "detector_metrics.csv")
+
+        seg_args = _post_train_common_infer_args_2d(args, out_dir, test_file, ckpt_path, segmentation_dir, "infer-detect-sam2")
+        seg_args.sam2_prompt_mode = str(getattr(args, "post_train_sam2_prompt_mode", "point+box"))
+        seg_args.sam2_multimask = bool(getattr(args, "post_train_sam2_multimask", False))
+        seg_args.min_sam2_mask_area = int(getattr(args, "post_train_min_sam2_mask_area", 3))
+        seg_args.save_volumes = bool(getattr(args, "post_train_save_volumes", True))
+        seg_args.save_gt_volume = bool(getattr(args, "post_train_save_gt_volume", False))
+        print(f"Running post-training SEGMENTATION test evaluation with {tag}: {ckpt_path}")
+        infer_detect_sam2(seg_args)
+        _copy_if_exists(segmentation_dir / "metrics.csv", segmentation_dir / "segmentation_metrics.csv")
+
 def train_detector(args: argparse.Namespace) -> None:
     seed_everything(args.seed)
     device = select_device(args.device)
@@ -1559,6 +1686,7 @@ def train_detector(args: argparse.Namespace) -> None:
 
     plot_training_metrics(out_dir / "metrics.csv", out_dir)
     print(f"Done. Best detector: {out_dir / 'best_detector.pt'}")
+    run_test_predictions_after_training(args, out_dir)
 
 
 # =============================================================================
@@ -1914,6 +2042,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--patience", type=int, default=10)
     p_train.add_argument("--min-delta", type=float, default=1e-5)
     p_train.add_argument("--cache-cases", action="store_true")
+    p_train.add_argument("--run-test-after-training", action=argparse.BooleanOptionalAction, default=True,
+                         help="After training, run infer-detect-sam2 on the test split with both best_detector.pt and last_detector.pt.")
+    p_train.add_argument("--post-train-save-volumes", action=argparse.BooleanOptionalAction, default=True,
+                         help="Save predicted NIfTI volumes during automatic post-training test prediction.")
+    p_train.add_argument("--post-train-save-gt-volume", action=argparse.BooleanOptionalAction, default=False,
+                         help="Also save GT masks during automatic post-training test prediction.")
+    p_train.add_argument("--post-train-eval-batch-size", type=int, default=16)
+    p_train.add_argument("--post-train-det-score-thresh", type=float, default=0.20)
+    p_train.add_argument("--post-train-topk-per-slice", type=int, default=3)
+    p_train.add_argument("--post-train-max-candidates-per-volume", type=int, default=20)
+    p_train.add_argument("--post-train-nms-iou", type=float, default=0.30)
+    p_train.add_argument("--post-train-eval-positive-slices-only", action="store_true")
+    p_train.add_argument("--post-train-sam2-prompt-mode", choices=["point", "box", "point+box"], default="point+box")
+    p_train.add_argument("--post-train-sam2-multimask", action="store_true")
+    p_train.add_argument("--post-train-min-sam2-mask-area", type=int, default=3)
+    p_train.add_argument("--post-train-fail-fast", action="store_true")
+    p_train.add_argument("--run-test-after-training", action=argparse.BooleanOptionalAction, default=True, help="After training, automatically run detector-guided SAM2 prediction on the test split using best_detector.pt.")
+    p_train.add_argument("--test-eval-batch-size", type=int, default=16, help="Batch size used by automatic post-training test prediction.")
+    p_train.add_argument("--test-det-score-thresh", type=float, default=0.20, help="Detector score threshold for automatic post-training test prediction.")
+    p_train.add_argument("--test-topk-per-slice", type=int, default=3, help="Top-k candidates per slice for automatic post-training test prediction.")
+    p_train.add_argument("--test-max-candidates-per-volume", type=int, default=20, help="Maximum detector candidates per volume for automatic post-training test prediction.")
+    p_train.add_argument("--test-nms-iou", type=float, default=0.30, help="2D NMS IoU for automatic post-training test prediction.")
+    p_train.add_argument("--test-eval-positive-slices-only", action="store_true", help="Debug option: only run automatic test prediction on GT-positive slices. Do not use for real testing.")
+    p_train.add_argument("--test-sam2-prompt-mode", choices=["point", "box", "point+box"], default="point+box", help="SAM2 prompt mode for automatic post-training test prediction.")
+    p_train.add_argument("--test-sam2-multimask", action="store_true", help="Use SAM2 multimask output during automatic post-training test prediction.")
+    p_train.add_argument("--test-min-sam2-mask-area", type=int, default=3, help="Minimum SAM2 mask area kept during automatic post-training test prediction.")
+    p_train.add_argument("--test-save-volumes", action=argparse.BooleanOptionalAction, default=True, help="Save predicted test volumes during automatic post-training test prediction.")
+    p_train.add_argument("--test-save-gt-volume", action=argparse.BooleanOptionalAction, default=False, help="Save GT volumes beside automatic post-training test predictions.")
+    p_train.add_argument("--test-fail-fast", action="store_true", help="Fail immediately if automatic post-training test prediction hits an error.")
 
     p_det = sub.add_parser("infer-detector", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     add_common_args(p_det)

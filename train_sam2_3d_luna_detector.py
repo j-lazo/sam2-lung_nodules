@@ -121,295 +121,6 @@ def write_pred_volume(pred: np.ndarray, reference_image: sitk.Image, out_path: P
     sitk.WriteImage(img, str(out_path))
 
 
-
-def binary_confusion_counts(gt: np.ndarray, pred: np.ndarray) -> Tuple[int, int, int, int]:
-    gt_b = gt.astype(bool)
-    pred_b = pred.astype(bool)
-    tp = int(np.logical_and(gt_b, pred_b).sum())
-    fp = int(np.logical_and(~gt_b, pred_b).sum())
-    fn = int(np.logical_and(gt_b, ~pred_b).sum())
-    tn = int(np.logical_and(~gt_b, ~pred_b).sum())
-    return tp, fp, fn, tn
-
-
-def iou_score(gt: np.ndarray, pred: np.ndarray, smooth: float = 1e-6) -> float:
-    gt_b = gt.astype(bool)
-    pred_b = pred.astype(bool)
-    inter = np.logical_and(gt_b, pred_b).sum(dtype=np.float64)
-    union = np.logical_or(gt_b, pred_b).sum(dtype=np.float64)
-    return float((inter + smooth) / (union + smooth))
-
-
-def precision_recall_f1(gt: np.ndarray, pred: np.ndarray, smooth: float = 1e-6) -> Dict[str, float]:
-    tp, fp, fn, tn = binary_confusion_counts(gt, pred)
-    precision = float((tp + smooth) / (tp + fp + smooth))
-    recall = float((tp + smooth) / (tp + fn + smooth))
-    f1 = float((2.0 * precision * recall + smooth) / (precision + recall + smooth))
-    return {"precision": precision, "recall": recall, "f1": f1, "tp": tp, "fp": fp, "fn": fn, "tn": tn}
-
-
-def _surface(mask: np.ndarray) -> np.ndarray:
-    mask = mask.astype(bool)
-    if not mask.any():
-        return mask
-    structure = ndimage.generate_binary_structure(mask.ndim, 1)
-    eroded = ndimage.binary_erosion(mask, structure=structure, border_value=0)
-    return np.logical_and(mask, ~eroded)
-
-
-def surface_distances_mm(mask_a: np.ndarray, mask_b: np.ndarray, spacing_zyx: Tuple[float, float, float]) -> np.ndarray:
-    a = mask_a.astype(bool)
-    b = mask_b.astype(bool)
-    if not a.any() or not b.any():
-        return np.array([], dtype=np.float32)
-    surf_a = _surface(a)
-    surf_b = _surface(b)
-    dt_b = ndimage.distance_transform_edt(~surf_b, sampling=spacing_zyx)
-    dt_a = ndimage.distance_transform_edt(~surf_a, sampling=spacing_zyx)
-    d_ab = dt_b[surf_a]
-    d_ba = dt_a[surf_b]
-    return np.concatenate([d_ab, d_ba]).astype(np.float32)
-
-
-def hd95_mm(gt: np.ndarray, pred: np.ndarray, spacing_zyx: Tuple[float, float, float]) -> float:
-    if not gt.astype(bool).any() and not pred.astype(bool).any():
-        return 0.0
-    if not gt.astype(bool).any() or not pred.astype(bool).any():
-        return float("nan")
-    d = surface_distances_mm(gt, pred, spacing_zyx)
-    return float(np.percentile(d, 95)) if d.size else float("nan")
-
-
-def assd_mm(gt: np.ndarray, pred: np.ndarray, spacing_zyx: Tuple[float, float, float]) -> float:
-    if not gt.astype(bool).any() and not pred.astype(bool).any():
-        return 0.0
-    if not gt.astype(bool).any() or not pred.astype(bool).any():
-        return float("nan")
-    d = surface_distances_mm(gt, pred, spacing_zyx)
-    return float(np.mean(d)) if d.size else float("nan")
-
-
-def volume_similarity(gt: np.ndarray, pred: np.ndarray, smooth: float = 1e-6) -> float:
-    g = float(gt.astype(bool).sum())
-    p = float(pred.astype(bool).sum())
-    return float(1.0 - abs(p - g) / (p + g + smooth))
-
-
-def get_spacing_zyx(image_itk: sitk.Image) -> Tuple[float, float, float]:
-    sx, sy, sz = image_itk.GetSpacing()
-    return float(sz), float(sy), float(sx)
-
-
-def segmentation_metrics(gt: np.ndarray, pred: np.ndarray, spacing_zyx: Tuple[float, float, float]) -> Dict[str, float]:
-    pr = precision_recall_f1(gt, pred)
-    return {
-        "DSC": dice_score(gt, pred),
-        "IoU": iou_score(gt, pred),
-        "seg_precision": pr["precision"],
-        "seg_recall": pr["recall"],
-        "seg_f1": pr["f1"],
-        "HD95_mm": hd95_mm(gt, pred, spacing_zyx),
-        "ASSD_mm": assd_mm(gt, pred, spacing_zyx),
-        "volume_similarity": volume_similarity(gt, pred),
-        "pred_voxels": int(pred.astype(bool).sum()),
-        "gt_voxels": int(gt.astype(bool).sum()),
-    }
-
-
-def extract_gt_nodules_3d(gt_volume: np.ndarray, spacing_zyx: Tuple[float, float, float], min_area: int = 1) -> List[Dict]:
-    labeled, num = ndimage.label(gt_volume.astype(bool), structure=ndimage.generate_binary_structure(3, 2))
-    nodules: List[Dict] = []
-    voxel_volume = float(spacing_zyx[0] * spacing_zyx[1] * spacing_zyx[2])
-    for k in range(1, num + 1):
-        comp = labeled == k
-        vox = int(comp.sum())
-        if vox < min_area:
-            continue
-        coords = np.argwhere(comp)
-        zmin, ymin, xmin = coords.min(axis=0)
-        zmax, ymax, xmax = coords.max(axis=0)
-        center = coords.mean(axis=0)  # z,y,x in voxels
-        extent_vox = np.array([zmax - zmin + 1, ymax - ymin + 1, xmax - xmin + 1], dtype=np.float32)
-        extent_mm = extent_vox * np.array(spacing_zyx, dtype=np.float32)
-        eq_diam_mm = float((6.0 * vox * voxel_volume / np.pi) ** (1.0 / 3.0))
-        nodules.append({
-            "nodule_id": int(k),
-            "mask": comp.astype(np.uint8),
-            "center_zyx": center.astype(np.float32),
-            "bbox_zyx": [int(zmin), int(ymin), int(xmin), int(zmax), int(ymax), int(xmax)],
-            "gt_volume_voxels": vox,
-            "gt_volume_mm3": float(vox * voxel_volume),
-            "gt_diameter_vox": float(max(extent_vox)),
-            "gt_diameter_mm": float(max(extent_mm)),
-            "gt_equivalent_diameter_mm": eq_diam_mm,
-        })
-    nodules.sort(key=lambda n: n["nodule_id"])
-    return nodules
-
-
-def candidate_fields(c) -> Tuple[float, float, float, float, Optional[np.ndarray]]:
-    z = float(getattr(c, "z"))
-    y = float(getattr(c, "y"))
-    x = float(getattr(c, "x"))
-    score = float(getattr(c, "score", np.nan))
-    box = getattr(c, "box", None)
-    if box is None:
-        box = getattr(c, "box_xyxy", None)
-    return z, y, x, score, None if box is None else np.asarray(box, dtype=np.float32)
-
-
-def center_error(c, nodule: Dict, spacing_zyx: Tuple[float, float, float]) -> Tuple[float, float, int]:
-    z, y, x, score, _ = candidate_fields(c)
-    center = nodule["center_zyx"]
-    dz, dy, dx = z - float(center[0]), y - float(center[1]), x - float(center[2])
-    err_vox = float(np.sqrt(dz * dz + dy * dy + dx * dx))
-    err_mm = float(np.sqrt((dz * spacing_zyx[0]) ** 2 + (dy * spacing_zyx[1]) ** 2 + (dx * spacing_zyx[2]) ** 2))
-    return err_vox, err_mm, int(round(abs(dz)))
-
-
-def match_candidates_to_gt(gt_volume: np.ndarray, candidates: List, spacing_zyx: Tuple[float, float, float], min_area: int = 1) -> Tuple[List[Dict], List[Dict], List[int]]:
-    nodules = extract_gt_nodules_3d(gt_volume, spacing_zyx, min_area=min_area)
-    matches: List[Dict] = []
-    used = set()
-    for ni, n in enumerate(nodules):
-        best = None
-        for ci, c in enumerate(candidates):
-            if ci in used:
-                continue
-            ev, em, ez = center_error(c, n, spacing_zyx)
-            radius_vox = max(2.0, 0.5 * float(n["gt_diameter_vox"]))
-            radius_mm = max(2.0, 0.5 * float(n["gt_diameter_mm"]))
-            if ev <= radius_vox or em <= radius_mm:
-                z, y, x, score, box = candidate_fields(c)
-                item = {"gt_index": ni, "cand_index": ci, "center_error_vox": ev, "center_error_mm": em, "slice_error": ez, "detector_confidence": score}
-                if best is None or item["center_error_mm"] < best["center_error_mm"]:
-                    best = item
-        if best is not None:
-            used.add(best["cand_index"])
-            matches.append(best)
-    unmatched_gt = [i for i in range(len(nodules)) if i not in {m["gt_index"] for m in matches}]
-    unmatched_cand = [i for i in range(len(candidates)) if i not in used]
-    return matches, nodules, unmatched_cand
-
-
-def detection_localization_metrics(gt_volume: np.ndarray, candidates: List, spacing_zyx: Tuple[float, float, float], min_area: int = 1) -> Dict[str, float]:
-    matches, nodules, unmatched_cand = match_candidates_to_gt(gt_volume, candidates, spacing_zyx, min_area=min_area)
-    tp = len(matches)
-    fn = max(0, len(nodules) - tp)
-    fp = len(unmatched_cand)
-    precision = float(tp / (tp + fp)) if (tp + fp) else 0.0
-    recall = float(tp / (tp + fn)) if (tp + fn) else 0.0
-    f1 = float(2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
-    center_errs_mm = [m["center_error_mm"] for m in matches]
-    center_errs_vox = [m["center_error_vox"] for m in matches]
-    slice_errs = [m["slice_error"] for m in matches]
-    return {
-        "det_TP": tp,
-        "det_FP": fp,
-        "det_FN": fn,
-        "det_precision": precision,
-        "det_recall": recall,
-        "det_f1": f1,
-        "n_gt_nodules": len(nodules),
-        "n_candidates": len(candidates),
-        "mean_center_error_mm": float(np.mean(center_errs_mm)) if center_errs_mm else np.nan,
-        "median_center_error_mm": float(np.median(center_errs_mm)) if center_errs_mm else np.nan,
-        "mean_center_error_vox": float(np.mean(center_errs_vox)) if center_errs_vox else np.nan,
-        "mean_slice_error": float(np.mean(slice_errs)) if slice_errs else np.nan,
-        "best_det_score": float(max([candidate_fields(c)[3] for c in candidates], default=np.nan)),
-    }
-
-
-def per_nodule_metrics(case: CaseData, pred: Optional[np.ndarray], candidates: List, min_area: int = 1) -> List[Dict]:
-    spacing_zyx = get_spacing_zyx(case.image_itk)
-    matches, nodules, unmatched = match_candidates_to_gt(case.gt_volume, candidates, spacing_zyx, min_area=min_area)
-    match_by_gt = {m["gt_index"]: m for m in matches}
-    rows: List[Dict] = []
-    for i, n in enumerate(nodules):
-        gt_mask = n["mask"].astype(np.uint8)
-        m = match_by_gt.get(i)
-        if pred is None:
-            dsc = np.nan
-            hd = np.nan
-        else:
-            dsc = dice_score(gt_mask, pred)
-            hd = hd95_mm(gt_mask, pred, spacing_zyx)
-        row = {
-            "SeriesUID": case.series_id,
-            "nodule_id": n["nodule_id"],
-            "GT_diameter_vox": n["gt_diameter_vox"],
-            "GT_diameter_mm": n["gt_diameter_mm"],
-            "GT_equivalent_diameter_mm": n["gt_equivalent_diameter_mm"],
-            "GT_volume_voxels": n["gt_volume_voxels"],
-            "GT_volume_mm3": n["gt_volume_mm3"],
-            "Detector_confidence": m["detector_confidence"] if m else np.nan,
-            "Center_error_vox": m["center_error_vox"] if m else np.nan,
-            "Center_error_mm": m["center_error_mm"] if m else np.nan,
-            "Slice_error": m["slice_error"] if m else np.nan,
-            "Dice": dsc,
-            "HD95_mm": hd,
-            "detected": bool(m is not None),
-        }
-        rows.append(row)
-    return rows
-
-
-def summarize_detection_operating_points(volume_rows: List[Dict]) -> Dict[str, float]:
-    if not volume_rows:
-        return {}
-    total_tp = int(np.nansum([r.get("det_TP", 0) for r in volume_rows]))
-    total_fp = int(np.nansum([r.get("det_FP", 0) for r in volume_rows]))
-    total_fn = int(np.nansum([r.get("det_FN", 0) for r in volume_rows]))
-    n_scans = max(1, len([r for r in volume_rows if r.get("status") == "ok"]))
-    precision = float(total_tp / (total_tp + total_fp)) if (total_tp + total_fp) else 0.0
-    recall = float(total_tp / (total_tp + total_fn)) if (total_tp + total_fn) else 0.0
-    f1 = float(2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
-    return {"overall_det_TP": total_tp, "overall_det_FP": total_fp, "overall_det_FN": total_fn, "overall_det_precision": precision, "overall_det_recall": recall, "overall_det_f1": f1, "FP_per_scan": float(total_fp / n_scans)}
-
-
-def save_detection_summary(rows: List[Dict], out_dir: Path) -> None:
-    summary = summarize_detection_operating_points(rows)
-    if summary:
-        pd.DataFrame([summary]).to_csv(out_dir / "detection_summary.csv", index=False)
-        with open(out_dir / "detection_summary.json", "w") as f:
-            json.dump(summary, f, indent=2)
-
-
-def plot_training_metrics(metrics_csv: Path, out_dir: Path) -> None:
-    if not metrics_csv.exists():
-        return
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except Exception as exc:
-        print(f"WARNING: could not import matplotlib for training plots: {exc}")
-        return
-    df = pd.read_csv(metrics_csv)
-    if df.empty or "epoch" not in df.columns:
-        return
-    numeric_cols = [c for c in df.columns if c != "epoch" and pd.api.types.is_numeric_dtype(df[c])]
-    if not numeric_cols:
-        return
-    loss_cols = [c for c in numeric_cols if "loss" in c.lower()]
-    metric_cols = [c for c in numeric_cols if c not in loss_cols and c != "lr"]
-    def _plot(cols: List[str], filename: str, title: str):
-        if not cols:
-            return
-        plt.figure(figsize=(10, 6))
-        for c in cols:
-            plt.plot(df["epoch"], df[c], marker="o", linewidth=1.5, label=c)
-        plt.xlabel("Epoch")
-        plt.ylabel("Value")
-        plt.title(title)
-        plt.grid(True, alpha=0.3)
-        plt.legend(loc="best", fontsize=8)
-        plt.tight_layout()
-        plt.savefig(out_dir / filename, dpi=200)
-        plt.close()
-    _plot(loss_cols, "training_validation_losses.png", "Training/validation losses")
-    _plot(metric_cols, "training_validation_metrics.png", "Training/validation metrics")
-
 def stable_uint32_seed(*items) -> int:
     payload = "::".join(str(x) for x in items).encode("utf-8")
     digest = hashlib.blake2b(payload, digest_size=8).digest()
@@ -1147,6 +858,57 @@ def load_checkpoint(model: SAM2Feature3DDetector, path: str, device: torch.devic
     return ckpt
 
 
+def run_test_prediction_after_training(args: argparse.Namespace, train_out_dir: Path) -> None:
+    """Run 3D-feature detector + SAM2 video prediction on the saved test split after training."""
+    if not getattr(args, "run_test_after_training", True):
+        print("Skipping automatic test prediction because --no-run-test-after-training was used.")
+        return
+
+    best_ckpt = train_out_dir / "best_detector.pt"
+    if not best_ckpt.exists():
+        print(f"WARNING: {best_ckpt} does not exist; skipping automatic test prediction.")
+        return
+
+    test_list = train_out_dir / "splits" / "test.txt"
+    test_ids = read_case_list(str(test_list)) if test_list.exists() else []
+    if not test_ids:
+        print("WARNING: test split is empty; skipping automatic test prediction.")
+        return
+
+    test_args = argparse.Namespace(**vars(args))
+    test_args.command = "infer-feature3d-sam2-video"
+    test_args.detector_checkpoint = str(best_ckpt)
+    test_args.output_dir = str(train_out_dir / "test_predictions")
+    test_args.create_experiment_dir = False
+    test_args.overwrite_experiment = True
+    test_args.train_case_list = str(train_out_dir / "splits" / "train.txt")
+    test_args.val_case_list = str(train_out_dir / "splits" / "val.txt")
+    test_args.test_case_list = str(test_list)
+    test_args.eval_split = "test"
+
+    # Defaults for inference-only arguments, unless the user provided training-time overrides.
+    test_args.infer_window_stride = getattr(args, "test_infer_window_stride", 4)
+    test_args.det_score_thresh = getattr(args, "test_det_score_thresh", 0.20)
+    test_args.topk_per_window = getattr(args, "test_topk_per_window", 3)
+    test_args.max_candidates_per_volume = getattr(args, "test_max_candidates_per_volume", 20)
+    test_args.video_prompt_z_merge_window = getattr(args, "test_video_prompt_z_merge_window", 3)
+    test_args.video_prompt_xy_merge_dist = getattr(args, "test_video_prompt_xy_merge_dist", 12.0)
+    test_args.keep_best_if_empty = getattr(args, "test_keep_best_if_empty", True)
+    test_args.fail_fast = getattr(args, "test_fail_fast", False)
+    test_args.max_video_prompts = getattr(args, "test_max_video_prompts", 5)
+    test_args.sam2_prompt_mode = getattr(args, "test_sam2_prompt_mode", "point+box")
+    test_args.video_bidirectional = getattr(args, "test_video_bidirectional", True)
+    test_args.vos_optimized = getattr(args, "test_vos_optimized", False)
+    test_args.frame_tmp_dir = getattr(args, "test_frame_tmp_dir", None)
+    test_args.frame_ext = getattr(args, "test_frame_ext", ".jpg")
+    test_args.cleanup_frames = getattr(args, "test_cleanup_frames", True)
+    test_args.save_volumes = getattr(args, "test_save_volumes", True)
+    test_args.save_gt_volume = getattr(args, "test_save_gt_volume", False)
+
+    print(f"Running automatic 3D SAM2-video test prediction on {len(test_ids)} test volumes. Output: {test_args.output_dir}")
+    infer_feature3d_sam2_video(test_args)
+
+
 def run_epoch(model, loader, optimizer, scaler, device, args, desc: str) -> Dict[str, float]:
     is_train = optimizer is not None
     model.train(is_train)
@@ -1181,6 +943,92 @@ def run_epoch(model, loader, optimizer, scaler, device, args, desc: str) -> Dict
         pbar.set_postfix({k: f"{totals[k] / max(n,1):.4f}" for k in totals})
     return {k: totals[k] / max(n, 1) for k in totals}
 
+
+
+def _post_train_common_infer_args_3d(args: argparse.Namespace, out_dir: Path, test_file: Path, ckpt_path: Path, output_dir: Path, command: str) -> argparse.Namespace:
+    """Build an inference Namespace for automatic post-training 3D test evaluation."""
+    pred_args = argparse.Namespace(**vars(args))
+    pred_args.command = command
+    pred_args.detector_checkpoint = str(ckpt_path)
+    pred_args.output_dir = str(output_dir)
+    pred_args.create_experiment_dir = False
+    pred_args.overwrite_experiment = True
+    pred_args.eval_split = "test"
+    pred_args.train_case_list = str(out_dir / "splits" / "train.txt")
+    pred_args.val_case_list = str(out_dir / "splits" / "val.txt")
+    pred_args.test_case_list = str(test_file)
+
+    pred_args.infer_window_stride = int(getattr(args, "post_train_infer_window_stride", 4))
+    pred_args.det_score_thresh = float(getattr(args, "post_train_det_score_thresh", 0.20))
+    pred_args.topk_per_window = int(getattr(args, "post_train_topk_per_window", 3))
+    pred_args.max_candidates_per_volume = int(getattr(args, "post_train_max_candidates_per_volume", 20))
+    pred_args.video_prompt_z_merge_window = int(getattr(args, "post_train_video_prompt_z_merge_window", 3))
+    pred_args.video_prompt_xy_merge_dist = float(getattr(args, "post_train_video_prompt_xy_merge_dist", 12.0))
+    pred_args.keep_best_if_empty = bool(getattr(args, "post_train_keep_best_if_empty", True))
+    pred_args.fail_fast = bool(getattr(args, "post_train_fail_fast", False))
+    return pred_args
+
+
+def _copy_if_exists(src: Path, dst: Path) -> None:
+    if src.exists():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+
+
+def run_test_predictions_after_training(args: argparse.Namespace, out_dir: Path) -> None:
+    """
+    Run four automatic test evaluations after training:
+      1) best weights -> 3D detector-only metrics/candidates
+      2) best weights -> 3D detector+SAM2-video segmentation metrics/volumes
+      3) last weights -> 3D detector-only metrics/candidates
+      4) last weights -> 3D detector+SAM2-video segmentation metrics/volumes
+
+    Output layout:
+      test_predictions/{best_weights,last_weights}/detector/
+          detector_metrics.csv, candidates.csv, detection_summary.*
+      test_predictions/{best_weights,last_weights}/segmentation/
+          segmentation_metrics.csv, nodule_metrics.csv, predicted_volumes/
+    """
+    if not getattr(args, "run_test_after_training", True):
+        print("Skipping post-training test evaluations because --no-run-test-after-training was set.")
+        return
+    test_file = out_dir / "splits" / "test.txt"
+    if not test_file.exists() or not test_file.read_text().strip():
+        print("Skipping post-training test evaluations because the test split is empty.")
+        return
+
+    runs = [
+        ("best_weights", out_dir / "best_detector.pt"),
+        ("last_weights", out_dir / "last_detector.pt"),
+    ]
+
+    for tag, ckpt_path in runs:
+        if not ckpt_path.exists():
+            print(f"WARNING: skipping {tag}; checkpoint not found: {ckpt_path}")
+            continue
+
+        root = out_dir / "test_predictions" / tag
+        detector_dir = root / "detector"
+        segmentation_dir = root / "segmentation"
+
+        det_args = _post_train_common_infer_args_3d(args, out_dir, test_file, ckpt_path, detector_dir, "infer-feature3d-detector")
+        print(f"Running post-training 3D DETECTOR test evaluation with {tag}: {ckpt_path}")
+        infer_feature3d_detector(det_args)
+        _copy_if_exists(detector_dir / "summary.csv", detector_dir / "detector_metrics.csv")
+
+        seg_args = _post_train_common_infer_args_3d(args, out_dir, test_file, ckpt_path, segmentation_dir, "infer-feature3d-sam2-video")
+        seg_args.max_video_prompts = int(getattr(args, "post_train_max_video_prompts", 5))
+        seg_args.sam2_prompt_mode = str(getattr(args, "post_train_sam2_prompt_mode", "point+box"))
+        seg_args.video_bidirectional = bool(getattr(args, "post_train_video_bidirectional", True))
+        seg_args.vos_optimized = bool(getattr(args, "post_train_vos_optimized", False))
+        seg_args.frame_tmp_dir = getattr(args, "post_train_frame_tmp_dir", None)
+        seg_args.frame_ext = str(getattr(args, "post_train_frame_ext", ".jpg"))
+        seg_args.cleanup_frames = bool(getattr(args, "post_train_cleanup_frames", True))
+        seg_args.save_volumes = bool(getattr(args, "post_train_save_volumes", True))
+        seg_args.save_gt_volume = bool(getattr(args, "post_train_save_gt_volume", False))
+        print(f"Running post-training 3D SEGMENTATION test evaluation with {tag}: {ckpt_path}")
+        infer_feature3d_sam2_video(seg_args)
+        _copy_if_exists(segmentation_dir / "metrics.csv", segmentation_dir / "segmentation_metrics.csv")
 
 def train_feature3d_detector(args: argparse.Namespace) -> None:
     seed_everything(args.seed)
@@ -1229,6 +1077,7 @@ def train_feature3d_detector(args: argparse.Namespace) -> None:
             break
     plot_training_metrics(out_dir / "metrics.csv", out_dir)
     print(f"Saved best checkpoint: {out_dir / 'best_detector.pt'}")
+    run_test_predictions_after_training(args, out_dir)
 
 
 def make_windows_for_case(case: CaseData, args: argparse.Namespace) -> List[int]:
@@ -1283,9 +1132,7 @@ def infer_feature3d_detector(args: argparse.Namespace) -> None:
                     "x1": float(c.box_xyxy[0]), "y1": float(c.box_xyxy[1]), "x2": float(c.box_xyxy[2]), "y2": float(c.box_xyxy[3]),
                     "z1": c.z_range[0], "z2": c.z_range[1],
                 })
-            spacing_zyx = get_spacing_zyx(case.image_itk)
-            det_metrics = detection_localization_metrics(case.gt_volume, cands, spacing_zyx, min_area=args.min_component_area)
-            summary.append({"VolumeID": sid, "status": "ok", **det_metrics})
+            summary.append({"VolumeID": sid, "status": "ok", "n_candidates": len(cands), "best_score": cands[0].score if cands else np.nan})
         except Exception as exc:
             if args.fail_fast:
                 raise
@@ -1293,7 +1140,6 @@ def infer_feature3d_detector(args: argparse.Namespace) -> None:
             print(f"ERROR {sid}: {repr(exc)}")
         pd.DataFrame(rows).to_csv(out_dir / "candidates.csv", index=False)
         pd.DataFrame(summary).to_csv(out_dir / "summary.csv", index=False)
-    save_detection_summary(summary, out_dir)
     print(f"Saved: {out_dir / 'candidates.csv'}")
 
 
@@ -1379,7 +1225,6 @@ def infer_feature3d_sam2_video(args: argparse.Namespace) -> None:
 
     rows = []
     prompt_rows = []
-    nodule_rows = []
     pred_root = out_dir / "predicted_volumes"
     for sid in tqdm(eval_ids, desc="cases"):
         try:
@@ -1389,16 +1234,13 @@ def infer_feature3d_sam2_video(args: argparse.Namespace) -> None:
                 continue
             cands = run_detector_on_case(detector, case, args, device)
             pred, logs = run_sam2_video_on_case(video_predictor, case, cands, args, device, out_dir)
-            spacing_zyx = get_spacing_zyx(case.image_itk)
+            dsc = dice_score(case.gt_volume, pred)
             rows.append({
-                "VolumeID": sid,
-                "status": "ok",
-                "n_video_prompts": min(len(cands), args.max_video_prompts),
-                **detection_localization_metrics(case.gt_volume, cands, spacing_zyx, min_area=args.min_component_area),
-                **segmentation_metrics(case.gt_volume, pred, spacing_zyx),
+                "VolumeID": sid, "status": "ok", "DSC": dsc, "n_candidates": len(cands),
+                "n_video_prompts": min(len(cands), args.max_video_prompts), "best_det_score": cands[0].score if cands else np.nan,
+                "pred_voxels": int(pred.sum()), "gt_voxels": int(case.gt_volume.sum()),
             })
             prompt_rows.extend(logs)
-            nodule_rows.extend(per_nodule_metrics(case, pred, cands, min_area=args.min_component_area))
             if args.save_volumes:
                 write_pred_volume(pred, case.image_itk, pred_root / "feature3d_sam2_video" / f"{sid}_feature3d_sam2_video.nii.gz")
                 if args.save_gt_volume:
@@ -1411,8 +1253,6 @@ def infer_feature3d_sam2_video(args: argparse.Namespace) -> None:
         pd.DataFrame(rows).to_csv(out_dir / "metrics.csv", index=False)
         if prompt_rows:
             pd.DataFrame(prompt_rows).to_csv(out_dir / "video_prompt_logs.csv", index=False)
-        if nodule_rows:
-            pd.DataFrame(nodule_rows).to_csv(out_dir / "nodule_metrics.csv", index=False)
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -1420,9 +1260,6 @@ def infer_feature3d_sam2_video(args: argparse.Namespace) -> None:
     df.to_csv(out_dir / "metrics.csv", index=False)
     if prompt_rows:
         pd.DataFrame(prompt_rows).to_csv(out_dir / "video_prompt_logs.csv", index=False)
-    if nodule_rows:
-        pd.DataFrame(nodule_rows).to_csv(out_dir / "nodule_metrics.csv", index=False)
-    save_detection_summary(rows, out_dir)
     ok = df[df["status"] == "ok"]
     if len(ok) > 0:
         print(f"Mean DSC: {pd.to_numeric(ok['DSC'], errors='coerce').mean():.6f}")
@@ -1490,6 +1327,45 @@ def add_train_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--patience", type=int, default=10)
     p.add_argument("--min-delta", type=float, default=1e-5)
     p.add_argument("--cache-cases", action="store_true")
+    p.add_argument("--run-test-after-training", action=argparse.BooleanOptionalAction, default=True,
+                   help="After training, run infer-feature3d-sam2-video on the test split with both best_detector.pt and last_detector.pt.")
+    p.add_argument("--post-train-save-volumes", action=argparse.BooleanOptionalAction, default=True,
+                   help="Save predicted NIfTI volumes during automatic post-training test prediction.")
+    p.add_argument("--post-train-save-gt-volume", action=argparse.BooleanOptionalAction, default=False,
+                   help="Also save GT masks during automatic post-training test prediction.")
+    p.add_argument("--post-train-infer-window-stride", type=int, default=4)
+    p.add_argument("--post-train-det-score-thresh", type=float, default=0.20)
+    p.add_argument("--post-train-topk-per-window", type=int, default=3)
+    p.add_argument("--post-train-max-candidates-per-volume", type=int, default=20)
+    p.add_argument("--post-train-video-prompt-z-merge-window", type=int, default=3)
+    p.add_argument("--post-train-video-prompt-xy-merge-dist", type=float, default=12.0)
+    p.add_argument("--post-train-keep-best-if-empty", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--post-train-fail-fast", action="store_true")
+    p.add_argument("--post-train-max-video-prompts", type=int, default=5)
+    p.add_argument("--post-train-sam2-prompt-mode", choices=["point", "box", "point+box"], default="point+box")
+    p.add_argument("--post-train-video-bidirectional", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--post-train-vos-optimized", action="store_true")
+    p.add_argument("--post-train-frame-tmp-dir", default=None)
+    p.add_argument("--post-train-frame-ext", choices=[".jpg", ".png"], default=".jpg")
+    p.add_argument("--post-train-cleanup-frames", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--run-test-after-training", action=argparse.BooleanOptionalAction, default=True, help="After training, automatically run 3D-feature detector + SAM2-video prediction on the test split using best_detector.pt.")
+    p.add_argument("--test-infer-window-stride", type=int, default=4, help="Window stride for automatic post-training test prediction.")
+    p.add_argument("--test-det-score-thresh", type=float, default=0.20, help="Detector score threshold for automatic post-training test prediction.")
+    p.add_argument("--test-topk-per-window", type=int, default=3, help="Top-k candidates per window for automatic post-training test prediction.")
+    p.add_argument("--test-max-candidates-per-volume", type=int, default=20, help="Maximum detector candidates per volume for automatic post-training test prediction.")
+    p.add_argument("--test-video-prompt-z-merge-window", type=int, default=3, help="Z merge window for automatic post-training test video prompts.")
+    p.add_argument("--test-video-prompt-xy-merge-dist", type=float, default=12.0, help="XY merge distance for automatic post-training test video prompts.")
+    p.add_argument("--test-keep-best-if-empty", action=argparse.BooleanOptionalAction, default=True, help="Keep best candidate if no score passes threshold during automatic test prediction.")
+    p.add_argument("--test-max-video-prompts", type=int, default=5, help="Maximum SAM2 video prompts per test volume after training.")
+    p.add_argument("--test-sam2-prompt-mode", choices=["point", "box", "point+box"], default="point+box", help="SAM2 prompt mode for automatic post-training test prediction.")
+    p.add_argument("--test-video-bidirectional", action=argparse.BooleanOptionalAction, default=True, help="Use bidirectional SAM2 video propagation for automatic post-training test prediction.")
+    p.add_argument("--test-vos-optimized", action="store_true", help="Use SAM2 VOS optimized mode during automatic post-training test prediction.")
+    p.add_argument("--test-frame-tmp-dir", default=None, help="Temporary frame parent directory for automatic post-training test prediction.")
+    p.add_argument("--test-frame-ext", choices=[".jpg", ".png"], default=".jpg", help="Frame format for automatic post-training SAM2-video prediction.")
+    p.add_argument("--test-cleanup-frames", action=argparse.BooleanOptionalAction, default=True, help="Delete temporary SAM2 video frames after automatic test prediction.")
+    p.add_argument("--test-save-volumes", action=argparse.BooleanOptionalAction, default=True, help="Save predicted test volumes during automatic post-training test prediction.")
+    p.add_argument("--test-save-gt-volume", action=argparse.BooleanOptionalAction, default=False, help="Save GT volumes beside automatic post-training test predictions.")
+    p.add_argument("--test-fail-fast", action="store_true", help="Fail immediately if automatic post-training test prediction hits an error.")
 
 
 def add_infer_args(p: argparse.ArgumentParser) -> None:
@@ -1534,7 +1410,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def validate_args(args: argparse.Namespace):
+def validate_args(args: argparse.Namespace) -> None:
     if args.num_context_slices < 1:
         raise ValueError("--num-context-slices must be >= 1")
     if args.num_context_slices % 2 == 0:
